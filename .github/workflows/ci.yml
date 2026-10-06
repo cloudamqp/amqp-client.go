@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - run: test -z "$(gofmt -l .)" || (gofmt -d . && exit 1)
+      - run: go vet ./...
+      - uses: dominikh/staticcheck-action@v1
+        with:
+          install-go: false
+
+  test:
+    name: test (${{ matrix.broker }}, go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.24", stable]
+        broker: [lavinmq, rabbitmq]
+        include:
+          - broker: lavinmq
+            image: cloudamqp/lavinmq:latest
+          - broker: rabbitmq
+            image: rabbitmq:4
+    services:
+      broker:
+        image: ${{ matrix.image }}
+        ports:
+          - 5672:5672
+    env:
+      AMQP_URL: amqp://guest:guest@localhost:5672
+      AMQP_REQUIRE_BROKER: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Wait for the broker
+        run: |
+          for i in $(seq 1 60); do
+            (exec 3<>/dev/tcp/localhost/5672) 2>/dev/null && exit 0
+            sleep 1
+          done
+          exit 1
+      - run: go test -race -count=1 -coverprofile=coverage.out ./...
