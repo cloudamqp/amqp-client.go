@@ -65,17 +65,21 @@ func (c *Client) RPCServer(ctx context.Context, queue string, handler RPCHandler
 // for the reply, use a context with a deadline to not wait forever. It uses
 // a shared [RPCClient].
 func (c *Client) RPCCall(ctx context.Context, queue string, msg Message) (*Delivery, error) {
-	c.rpcMu.Lock()
+	select {
+	case c.rpcSem <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if c.rpcClient == nil {
 		rpc, err := c.RPCClient(ctx)
 		if err != nil {
-			c.rpcMu.Unlock()
+			<-c.rpcSem
 			return nil, err
 		}
 		c.rpcClient = rpc
 	}
 	rpc := c.rpcClient
-	c.rpcMu.Unlock()
+	<-c.rpcSem
 	return rpc.Call(ctx, queue, msg)
 }
 
@@ -157,7 +161,14 @@ func (r *RPCClient) channel(ctx context.Context) (*Channel, error) {
 			ch.OnReturn(func(ret *Return) { r.fail(ret.CorrelationID, ErrUnroutable) })
 			var cons *Consumer
 			if cons, err = ch.BasicConsume(ctx, directReplyTo, ConsumeOptions{NoAck: true}); err == nil {
+				r.mu.Lock()
+				if r.closed { // Close ran meanwhile, it didn't see this channel
+					r.mu.Unlock()
+					ch.Close()
+					return nil, ErrClosed
+				}
 				r.ch.Store(ch)
+				r.mu.Unlock()
 				go r.dispatch(ch, cons)
 				return ch, nil
 			}
@@ -264,11 +275,12 @@ func (r *RPCClient) Call(ctx context.Context, queue string, msg Message) (*Deliv
 func (r *RPCClient) Close() error {
 	r.mu.Lock()
 	r.closed = true
+	ch := r.ch.Load() // a channel installed later is closed by its installer
 	r.mu.Unlock()
 	r.c.topoMu.Lock()
 	delete(r.c.rpcClients, r)
 	r.c.topoMu.Unlock()
-	if ch := r.ch.Load(); ch != nil {
+	if ch != nil {
 		return ch.Close()
 	}
 	return nil

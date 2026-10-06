@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,8 +86,8 @@ type Client struct {
 	subs       map[*Subscription]struct{}
 	rpcClients map[*RPCClient]struct{}
 
-	rpcMu     sync.Mutex
-	rpcClient *RPCClient // shared by RPCCall
+	rpcSem    chan struct{} // guards creating rpcClient
+	rpcClient *RPCClient    // shared by RPCCall
 
 	knownExchanges sync.Map // names of exchanges known to exist
 
@@ -139,6 +140,7 @@ func NewClient(ctx context.Context, url string, opts *ClientOptions) (*Client, e
 		rpcClients: map[*RPCClient]struct{}{},
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.rpcSem = make(chan struct{}, 1)
 	c.ops = &lazyChannel{c: c}
 	c.gets = &lazyChannel{c: c}
 	c.pub = &lazyChannel{c: c, confirm: true}
@@ -301,8 +303,10 @@ func (c *Client) connect() (*Connection, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.recoverTopology(conn); err != nil {
-		conn.Close()
+	if err := c.recoverTopology(ctx, conn); err != nil {
+		// Don't wait for a broker that might be stalled to confirm the close
+		conn.abort(ErrClosed)
+		<-conn.Done()
 		return nil, err
 	}
 	return conn, nil
@@ -333,14 +337,16 @@ func (c *Client) backoff(failures *int, interval *time.Duration, err error) bool
 // recoverTopology redeclares exchanges, queues and bindings on a new
 // connection. Subscriptions recover themselves once the connection is
 // published. Declarations the broker rejects are logged and skipped.
-func (c *Client) recoverTopology(conn *Connection) error {
-	ctx, cancel := context.WithTimeout(c.ctx, time.Minute)
-	defer cancel()
+func (c *Client) recoverTopology(ctx context.Context, conn *Connection) (err error) {
 	ch, err := conn.Channel(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { ch.Close() }()
+	defer func() {
+		if err == nil {
+			ch.Close()
+		} // otherwise the connection is aborted
+	}()
 	reopen := func() error {
 		next, err := conn.Channel(ctx)
 		if err == nil {
@@ -621,6 +627,13 @@ func (c *Client) encode(msg *Message) (Publishing, error) {
 // If the connection is lost before the message is confirmed an error is
 // returned, the message may or may not have reached the broker.
 func (c *Client) Publish(ctx context.Context, exchange, routingKey string, msg Message) error {
+	return c.publish(ctx, exchange, func() string { return routingKey }, msg)
+}
+
+// publish resolves the routing key on each attempt, after a channel on the
+// current connection is obtained, as a server-named queue's name changes
+// when the client reconnects.
+func (c *Client) publish(ctx context.Context, exchange string, routingKey func() string, msg Message) error {
 	p, err := c.encode(&msg)
 	if err != nil {
 		return err
@@ -633,7 +646,7 @@ func (c *Client) Publish(ctx context.Context, exchange, routingKey string, msg M
 		if err != nil {
 			return err
 		}
-		conf, err := ch.BasicPublishConfirm(ctx, exchange, routingKey, p)
+		conf, err := ch.BasicPublishConfirm(ctx, exchange, routingKey(), p)
 		if err != nil {
 			if errors.Is(err, ErrClosed) && ctx.Err() == nil {
 				continue // the message wasn't sent, retry on a new channel
@@ -641,10 +654,18 @@ func (c *Client) Publish(ctx context.Context, exchange, routingKey string, msg M
 			return err
 		}
 		err = conf.Wait(ctx)
-		if IsCode(ch.Err(), NotFound) {
-			c.knownExchanges.Clear() // one was deleted, check them again
-		}
+		c.invalidateExchanges(err)
 		return err
+	}
+}
+
+// invalidateExchanges forgets the exchanges known to exist if a publish
+// failed because one was deleted. The confirmation is failed before the
+// channel's error is set, so the cause it carries is checked.
+func (c *Client) invalidateExchanges(err error) {
+	var ue *unconfirmedError
+	if errors.As(err, &ue) && IsCode(ue.cause, NotFound) {
+		c.knownExchanges.Clear() // check them again
 	}
 }
 
@@ -901,9 +922,11 @@ func (c *Client) removeExchange(name string) {
 	c.xbindings = xbs
 }
 
+// sameArgs compares binding arguments, including the values' types, which
+// headers exchanges distinguish.
 func sameArgs(a, b Table) bool {
-	if len(a) != len(b) {
-		return false
+	if len(a) == 0 && len(b) == 0 {
+		return true // nil and empty are the same on the wire
 	}
-	return fmt.Sprint(a) == fmt.Sprint(b)
+	return reflect.DeepEqual(a, b)
 }

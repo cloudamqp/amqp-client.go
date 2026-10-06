@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Queue.Publish` to a server-named queue while the client was reconnecting used the queue's old name, so the message was dropped as unroutable and still reported as published.
+- A handler calling `Subscription.Cancel` while another goroutine (or `Client.Close`) was waiting for it deadlocked.
+- Buffered deliveries of a no-ack subscription were lost when the subscription replaced its consumer, e.g. after a channel error.
+- A publish failing because its exchange was deleted didn't always make the client check exchanges again, so later publishes to it closed the shared publish channel.
+- An `RPCClient` closed while it was recovering its reply channel left the new channel open.
+- Topology recovery wasn't bounded by `Config.ConnectTimeout`, and a failed recovery waited for the broker to confirm the close.
+- Concurrent first `RPCCall`s waited for the one creating the shared RPC client without honouring their own contexts.
+- Bindings whose arguments differed only in value types, e.g. `int32(1)` and `"1"` for a headers exchange, were treated as duplicates and not recovered.
+- `BasicAck(0, true)` and `BasicNack(0, true, …)`, which settle all deliveries, didn't mark the deliveries as acknowledged, so acknowledging them again closed the channel.
+
 ## [1.2.0] - 2026-10-06
 
 ### Added

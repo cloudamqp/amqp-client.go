@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -588,7 +589,7 @@ func TestFakeRecoverBindingAfterNotFound(t *testing.T) {
 	c.exchanges["x"] = x
 	c.queues = []*Queue{q}
 	c.qbindings = []queueBinding{{q: q, exchange: "x", routingKey: "#"}}
-	if err := c.recoverTopology(conn); err != nil {
+	if err := c.recoverTopology(context.Background(), conn); err != nil {
 		t.Fatal(err)
 	}
 	if fmt.Sprint(steps) != "[exchange.declare queue.declare queue.bind]" {
@@ -933,5 +934,154 @@ func TestFakeUpdateSecretPairsReplies(t *testing.T) {
 	}
 	if time.Since(start) < 150*time.Millisecond {
 		t.Fatal("B returned on A's reply")
+	}
+}
+
+// fakeClient returns a Client whose connections go to fake brokers, the
+// nth connection runs scripts[n] (the last one is repeated).
+func fakeClient(t *testing.T, opts *ClientOptions, scripts ...func(f *fakeBroker)) *Client {
+	t.Helper()
+	if opts == nil {
+		opts = &ClientOptions{}
+	}
+	var mu sync.Mutex
+	n := 0
+	quit := make(chan struct{})
+	var wg sync.WaitGroup
+	opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	opts.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		script := scripts[min(n, len(scripts)-1)]
+		n++
+		mu.Unlock()
+		client, server := net.Pipe()
+		f := &fakeBroker{t: t, conn: server, br: bufio.NewReader(server), quit: quit}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer server.Close()
+			if f.handshake(nil) == nil {
+				script(f)
+			}
+		}()
+		return client, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := NewClient(ctx, "amqp://localhost", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		close(quit)
+		go c.Close()
+		wg.Wait()
+	})
+	return c
+}
+
+// Review: a stalled topology recovery is bounded by ConnectTimeout
+func TestFakeRecoveryRespectsConnectTimeout(t *testing.T) {
+	first := make(chan *fakeBroker, 1)
+	failed := make(chan error, 1)
+	start := time.Now()
+	fakeClient(t, &ClientOptions{
+		Config:            Config{ConnectTimeout: 200 * time.Millisecond},
+		ReconnectInterval: 10 * time.Millisecond,
+		MaxRetries:        2,
+		OnFailed:          func(err error) { failed <- err },
+	}, func(f *fakeBroker) {
+		first <- f
+		<-f.quit
+	}, func(f *fakeBroker) {
+		f.expect(channelOpen) // never answered
+		<-f.quit
+	})
+	(<-first).conn.Close()
+	select {
+	case <-failed:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("expected the client to give up, after %v", time.Since(start))
+	}
+}
+
+// Review: concurrent first RPCCalls honour their own contexts
+func TestFakeRPCCallInitHonoursContext(t *testing.T) {
+	c := fakeClient(t, nil, func(f *fakeBroker) {
+		f.openChannel()
+		f.expect(basicConsume) // never answered
+		<-f.quit
+	})
+	go c.RPCCall(context.Background(), "q", Message{Body: "first"})
+	time.Sleep(50 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := c.RPCCall(ctx, "q", Message{Body: "second"}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("the call waited %v", time.Since(start))
+	}
+}
+
+// Review: an RPC reply channel recovered while the client closes is closed
+func TestFakeRPCClientCloseDuringRecovery(t *testing.T) {
+	consumeSeen := make(chan struct{})
+	closed := make(chan struct{})
+	gotClose := make(chan bool, 1)
+	c := fakeClient(t, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.consume("reply-1")
+		// The broker closes the reply channel
+		args := be.AppendUint16(nil, InternalError)
+		args = appendShortStr(args, "INTERNAL_ERROR")
+		f.method(ch, channelClose, append(args, 0, 0, 0, 0))
+		f.expect(channelCloseOk)
+		// The next call recovers it
+		ch2 := f.openChannel()
+		f.expect(basicConsume)
+		close(consumeSeen)
+		<-closed
+		f.method(ch2, basicConsumeOk, appendShortStr(nil, "reply-2"))
+		for {
+			fr, err := f.read()
+			if err != nil {
+				gotClose <- false
+				return
+			}
+			if fr.typ == frameMethod && fr.method() == channelClose && fr.channel == ch2 {
+				f.method(ch2, channelCloseOk, nil)
+				gotClose <- true
+				<-f.quit
+				return
+			}
+		}
+	})
+	r, err := c.RPCClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for r.ch.Load() == nil || !r.ch.Load().IsClosed() {
+		time.Sleep(time.Millisecond)
+	}
+	callErr := make(chan error, 1)
+	go func() {
+		_, err := r.Call(context.Background(), "q", Message{Body: "x"})
+		callErr <- err
+	}()
+	<-consumeSeen
+	r.Close()
+	close(closed)
+	if err := <-callErr; !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+	select {
+	case ok := <-gotClose:
+		if !ok {
+			t.Fatal("the connection closed instead")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the recovered reply channel was left open")
 	}
 }

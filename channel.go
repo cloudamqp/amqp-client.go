@@ -55,6 +55,8 @@ type Channel struct {
 	// settledUpTo is the highest delivery tag acked or nacked with
 	// multiple, the deliveries up to it are settled.
 	settledUpTo atomic.Uint64
+	// lastDeliveryTag is the tag of the latest delivery or get-ok
+	lastDeliveryTag atomic.Uint64
 }
 
 type rpcWaiter struct {
@@ -432,6 +434,7 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 		tag := d.shortStrBytes()
 		m := &Delivery{channel: ch}
 		m.DeliveryTag = d.u64()
+		ch.lastDeliveryTag.Store(m.DeliveryTag)
 		m.Redelivered = d.u8()&1 != 0
 		m.Exchange = cached(d.shortStrBytes(), &ch.lastExchange)
 		m.RoutingKey = cached(d.shortStrBytes(), &ch.lastRoutingKey)
@@ -452,6 +455,7 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 	case basicGetOk:
 		m := &Delivery{channel: ch}
 		m.DeliveryTag = d.u64()
+		ch.lastDeliveryTag.Store(m.DeliveryTag)
 		m.Redelivered = d.u8()&1 != 0
 		m.Exchange = cached(d.shortStrBytes(), &ch.lastExchange)
 		m.RoutingKey = cached(d.shortStrBytes(), &ch.lastRoutingKey)
@@ -1070,8 +1074,12 @@ func (ch *Channel) BasicNack(deliveryTag uint64, multiple, requeue bool) error {
 	})
 }
 
-// settled records that all deliveries up to tag are acknowledged.
+// settled records that all deliveries up to tag are acknowledged. Tag 0
+// with multiple means all deliveries so far.
 func (ch *Channel) settled(tag uint64) {
+	if tag == 0 {
+		tag = ch.lastDeliveryTag.Load()
+	}
 	for {
 		old := ch.settledUpTo.Load()
 		if tag <= old || ch.settledUpTo.CompareAndSwap(old, tag) {

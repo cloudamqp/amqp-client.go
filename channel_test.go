@@ -882,3 +882,28 @@ func TestAckDoesntCloseTheChannel(t *testing.T) {
 		t.Fatalf("expected the channel to stay open, got %v", err)
 	}
 }
+
+// Review: BasicAck(0, true) settles all deliveries so far
+func TestAckAllWithZeroTag(t *testing.T) {
+	conn := dialTest(t, nil)
+	ch := openChannel(t, conn)
+	ctx := testContext(t)
+	q := tempQueue(t, ch)
+	ch.BasicPublish(ctx, "", q, Publishing{Body: []byte("1")})
+	ch.BasicPublish(ctx, "", q, Publishing{Body: []byte("2")})
+	cons, err := ch.BasicConsume(ctx, q, ConsumeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := cons.Next(ctx)
+	d2, _ := cons.Next(ctx)
+	if err := ch.BasicAck(0, true); err != nil {
+		t.Fatal(err)
+	}
+	if !d1.Acknowledged() || !errors.Is(d1.Ack(), ErrAlreadyAcknowledged) || !errors.Is(d2.Ack(), ErrAlreadyAcknowledged) {
+		t.Fatal("expected the deliveries to be acknowledged")
+	}
+	if _, err := ch.QueueDeclare(ctx, q, QueueDeclareOptions{Passive: true}); err != nil {
+		t.Fatalf("expected the channel to stay open, got %v", err)
+	}
+}

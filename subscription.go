@@ -152,20 +152,24 @@ func (s *Subscription) current() (*Consumer, chan struct{}) {
 
 func (s *Subscription) work() {
 	defer s.workers.Done()
+	cons, changed := s.current()
 	for {
-		cons, changed := s.current()
 		d, err := cons.Next(s.ctx)
 		if s.ctx.Err() != nil {
 			return // the message (if any) is requeued when the channel closes
 		}
 		if err != nil {
-			// The consumer stopped, wait for the monitor to replace it
-			select {
-			case <-changed:
-				continue
-			case <-s.ctx.Done():
-				return
+			// The consumer is drained, buffered no-ack deliveries included,
+			// move on to its replacement once the monitor has installed it
+			if next, _ := s.current(); next == cons {
+				select {
+				case <-changed:
+				case <-s.ctx.Done():
+					return
+				}
 			}
+			cons, changed = s.current()
+			continue
 		}
 		s.handle(d)
 	}
@@ -292,8 +296,13 @@ func (s *Subscription) stop(reason error, cancelConsumer bool) {
 }
 
 func (s *Subscription) stopCtx(ctx context.Context, reason error, cancelConsumer bool) error {
+	// Only starting the stop is done once, waiting for the handlers is done
+	// outside of it, as a handler may call Cancel while another goroutine
+	// waits for it to return
 	var err error
+	first := false
 	s.once.Do(func() {
+		first = true
 		s.cancel()
 		s.mu.Lock()
 		s.stopped = true
@@ -302,36 +311,31 @@ func (s *Subscription) stopCtx(ctx context.Context, reason error, cancelConsumer
 		if cancelConsumer {
 			err = cons.Cancel(ctx)
 		}
-		finish := func() {
+		go func() {
+			s.workers.Wait()
 			cons.ch.Close() // requeues messages that weren't processed
 			s.c.topoMu.Lock()
 			delete(s.c.subs, s)
 			s.c.topoMu.Unlock()
 			s.err = reason
 			close(s.done)
-		}
-		if ctx.Value(handlerKey{}) == s {
-			// Called from a handler, which can't wait for itself
-			go func() {
-				s.workers.Wait()
-				finish()
-			}()
-			return
-		}
-		waited := make(chan struct{})
-		go func() {
-			s.workers.Wait()
-			close(waited)
 		}()
-		select {
-		case <-waited:
-		case <-ctx.Done():
-			if err == nil {
-				err = ctx.Err()
-			}
-		}
-		finish()
 	})
+	if ctx.Value(handlerKey{}) == s {
+		return err // called from a handler, which can't wait for itself
+	}
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+		if first {
+			// Don't keep unprocessed messages from other consumers
+			cons, _ := s.current()
+			go cons.ch.Close()
+		}
+		if err == nil {
+			err = ctx.Err()
+		}
+	}
 	return err
 }
 

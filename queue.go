@@ -49,7 +49,7 @@ func (q *Queue) declare(ctx context.Context, ch *Channel) error {
 // Publish publishes a message directly to the queue, via the default
 // exchange, and waits for the broker to confirm it. See [Client.Publish].
 func (q *Queue) Publish(ctx context.Context, msg Message) error {
-	return q.c.Publish(ctx, "", q.Name(), msg)
+	return q.c.publish(ctx, "", q.Name, msg)
 }
 
 // Bind binds the queue to an exchange. The binding is recovered when the

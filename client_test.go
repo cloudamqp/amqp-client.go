@@ -1022,3 +1022,170 @@ func TestSubscribeRacingClose(t *testing.T) {
 		t.Fatalf("expected ErrClosed from a subscribe that raced Close, got %v", err)
 	}
 }
+
+// Review: publishing to a server-named queue while reconnecting uses its new name
+func TestClientQueuePublishAcrossReconnect(t *testing.T) {
+	p := newProxy(t)
+	c := newTestClient(t, p.url(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler, bodies := collect(10)
+	if _, err := q.Subscribe(ctx, handler, nil); err != nil {
+		t.Fatal(err)
+	}
+	oldName := q.Name()
+	p.cut()
+	// Published while the client is disconnected
+	if err := q.Publish(ctx, Message{Body: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	if q.Name() == oldName {
+		t.Fatal("expected a new name")
+	}
+	receive(t, bodies, 1)
+}
+
+// Review: a handler cancelling its subscription while Close waits for it
+func TestSubscriptionCancelFromHandlerDuringClose(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var sub *Subscription
+	sub, err = q.Subscribe(ctx, func(hctx context.Context, d *Delivery) error {
+		close(started)
+		<-release
+		return sub.Cancel(hctx)
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.Publish(ctx, Message{Body: "x"})
+	<-started
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- sub.Cancel(context.Background()) }() // waits for the handler
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("deadlock")
+	}
+}
+
+// Review: buffered no-ack deliveries aren't lost when the consumer is replaced
+func TestNoAckSubscriptionKeepsBufferedDeliveries(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, "", &QueueOptions{Exclusive: true}) // survives its consumer
+	if err != nil {
+		t.Fatal(err)
+	}
+	release := make(chan struct{})
+	handler, bodies := collect(10)
+	var once sync.Once
+	var sub *Subscription
+	sub, err = q.Subscribe(ctx, func(ctx context.Context, d *Delivery) error {
+		once.Do(func() {
+			<-release
+			// Close the channel: the buffered deliveries stay, and the
+			// subscription gets a new consumer
+			old, _ := sub.current()
+			d.Channel().BasicAck(d.DeliveryTag+1000, false)
+			<-d.Channel().Done()
+			for cur, _ := sub.current(); cur == old; cur, _ = sub.current() {
+				time.Sleep(time.Millisecond)
+			}
+		})
+		return handler(ctx, d)
+	}, &SubscribeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 6 {
+		q.Publish(ctx, Message{Body: fmt.Sprint(i)})
+	}
+	time.Sleep(100 * time.Millisecond) // let them be buffered
+	close(release)
+	got := receive(t, bodies, 6)
+	for i, b := range got {
+		if b != fmt.Sprint(i) {
+			t.Fatalf("unexpected %v", got)
+		}
+	}
+}
+
+// Review: a publish failing because its exchange was deleted elsewhere
+// makes the client check exchanges again
+func TestClientExchangeCacheInvalidation(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	name := randomName("test-deleted-exchange")
+	x, err := c.FanoutExchange(ctx, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Publish(ctx, "", Message{Body: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	// Deleted behind the client's back
+	conn := dialTest(t, nil)
+	if err := openChannel(t, conn).ExchangeDelete(ctx, name, false); err != nil {
+		t.Fatal(err)
+	}
+	c.topoMu.Lock()
+	delete(c.exchanges, name) // don't recreate it on reconnect
+	c.topoMu.Unlock()
+	if err := x.Publish(ctx, "", Message{Body: "x"}); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("expected ErrUnconfirmed, got %v", err)
+	}
+	// Checked again, it fails on its own
+	if err := x.Publish(ctx, "", Message{Body: "x"}); !IsCode(err, NotFound) {
+		t.Fatalf("expected not found from the exchange check, got %v", err)
+	}
+}
+
+// Review: the cache is invalidated from the confirmation's error, which
+// is set before the channel's
+func TestExchangeCacheInvalidatedByUnconfirmed(t *testing.T) {
+	c := &Client{}
+	c.knownExchanges.Store("x", struct{}{})
+	c.invalidateExchanges(&unconfirmedError{&Error{Code: AccessRefused}})
+	if _, ok := c.knownExchanges.Load("x"); !ok {
+		t.Fatal("only a missing exchange should invalidate the cache")
+	}
+	c.invalidateExchanges(&unconfirmedError{&Error{Code: NotFound}})
+	if _, ok := c.knownExchanges.Load("x"); ok {
+		t.Fatal("expected the cache to be cleared")
+	}
+}
+
+// Review: binding arguments are compared with their types
+func TestSameArgs(t *testing.T) {
+	if sameArgs(Table{"v": int32(1)}, Table{"v": "1"}) {
+		t.Fatal("expected different types to differ")
+	}
+	if !sameArgs(nil, Table{}) || !sameArgs(Table{"a": Table{"b": 1}}, Table{"a": Table{"b": 1}}) {
+		t.Fatal("expected equal tables")
+	}
+	c := &Client{}
+	q := &Queue{}
+	b1 := queueBinding{q: q, exchange: "amq.headers", args: Table{"v": int32(1)}}
+	b2 := queueBinding{q: q, exchange: "amq.headers", args: Table{"v": "1"}}
+	c.addQueueBinding(b1)
+	c.addQueueBinding(b2)
+	if len(c.qbindings) != 2 {
+		t.Fatalf("expected 2 bindings, got %d", len(c.qbindings))
+	}
+	c.removeQueueBinding(b2)
+	if len(c.qbindings) != 1 || c.qbindings[0].args["v"] != int32(1) {
+		t.Fatalf("the wrong binding was removed: %v", c.qbindings)
+	}
+}
