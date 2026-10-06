@@ -17,18 +17,23 @@ type ClientOptions struct {
 
 	// ReconnectInterval is the delay before the second reconnect attempt
 	// (the first is immediate), doubled for each failed attempt up to
-	// MaxReconnectInterval. Defaults to 1s and 30s.
+	// MaxReconnectInterval. Defaults to 1s and 30s. A connection that's
+	// lost within MaxReconnectInterval of being established counts as a
+	// failed attempt, so a broker that closes connections right away isn't
+	// reconnected to in a tight loop.
 	ReconnectInterval    time.Duration
 	MaxReconnectInterval time.Duration
 	// MaxRetries is the number of consecutive failed reconnect attempts
-	// before the client gives up and closes. Zero retries forever.
+	// before the client gives up and closes. Zero retries forever. Each
+	// attempt is bounded by Config.ConnectTimeout, 30s by default.
 	MaxRetries int
 
 	// OnConnect is called after each successful connection, including the
-	// first one, once topology and consumers are recovered. The client's
-	// methods can be used in it, e.g. to declare topology that isn't
-	// recovered automatically. An error from the first call makes NewClient
-	// fail, later errors are logged.
+	// first one, once the topology is recovered. The client's methods can
+	// be used in it, e.g. to declare topology that isn't recovered
+	// automatically. Its context is cancelled if the connection is lost.
+	// An error from the first call makes NewClient fail, later errors are
+	// logged. Later calls run in their own goroutine, one at a time.
 	OnConnect func(ctx context.Context, c *Client) error
 	// OnDisconnect is called when the connection is lost.
 	OnDisconnect func(err error)
@@ -79,7 +84,10 @@ type Client struct {
 	rpcMu     sync.Mutex
 	rpcClient *RPCClient // shared by RPCCall
 
-	closeOnce sync.Once
+	knownExchanges sync.Map // names of exchanges known to exist
+
+	closeOnce   sync.Once
+	onConnectMu sync.Mutex // serializes OnConnect calls
 }
 
 type queueBinding struct {
@@ -136,14 +144,33 @@ func NewClient(ctx context.Context, url string, opts *ClientOptions) (*Client, e
 		return nil, err
 	}
 	c.setConn(conn) // the client can't be closed yet
+	go c.supervise(conn)
 	if o.OnConnect != nil {
-		if err := o.OnConnect(ctx, c); err != nil {
+		if err := c.runOnConnect(ctx, conn); err != nil {
 			c.Close()
 			return nil, err
 		}
 	}
-	go c.supervise(conn)
 	return c, nil
+}
+
+// runOnConnect calls OnConnect with a context that's cancelled if conn is
+// lost, so that it can't wait forever for a connection.
+func (c *Client) runOnConnect(ctx context.Context, conn *Connection) error {
+	c.onConnectMu.Lock()
+	defer c.onConnectMu.Unlock()
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := context.AfterFunc(c.ctx, func() { cancel(ErrClosed) })
+	defer stop()
+	go func() {
+		select {
+		case <-conn.Done():
+			cancel(conn.Err())
+		case <-ctx.Done():
+		}
+	}()
+	return c.opts.OnConnect(ctx, c)
 }
 
 // setConn publishes a new connection, it returns false (and closes the
@@ -189,8 +216,15 @@ func (c *Client) Connection(ctx context.Context) (*Connection, error) {
 	return c.connection(ctx)
 }
 
+// supervise reconnects when the connection is lost. A connection that's
+// lost within MaxReconnectInterval of being established counts as a failed
+// attempt, so that a connection the broker closes right away (e.g. because
+// of a connection limit) is retried with backoff and MaxRetries applies.
 func (c *Client) supervise(conn *Connection) {
+	failures := 0 // consecutive failed attempts
+	interval := c.opts.ReconnectInterval
 	for {
+		connectedAt := time.Now()
 		select {
 		case <-conn.Done():
 		case <-c.ctx.Done():
@@ -211,52 +245,75 @@ func (c *Client) supervise(conn *Connection) {
 		if c.opts.OnDisconnect != nil {
 			c.opts.OnDisconnect(err)
 		}
-		if conn = c.reconnect(); conn == nil {
+		if time.Since(connectedAt) >= c.opts.MaxReconnectInterval {
+			failures, interval = 0, c.opts.ReconnectInterval
+		} else if !c.backoff(&failures, &interval, err) {
 			return
+		}
+		for {
+			if conn, err = c.connect(); err == nil {
+				break
+			}
+			if c.ctx.Err() != nil || !c.backoff(&failures, &interval, err) {
+				return
+			}
+		}
+		if !c.setConn(conn) {
+			return
+		}
+		c.log.Info("amqp: reconnected", "attempts", failures+1)
+		if c.opts.OnConnect != nil {
+			go func(conn *Connection) {
+				if err := c.runOnConnect(c.ctx, conn); err != nil {
+					c.log.Error("amqp: OnConnect failed", "error", err)
+				}
+			}(conn)
 		}
 	}
 }
 
-func (c *Client) reconnect() *Connection {
-	interval := c.opts.ReconnectInterval
-	for attempt := 1; ; attempt++ {
-		conn, err := DialURI(c.ctx, c.uri, &c.opts.Config)
-		if err == nil {
-			if err = c.recoverTopology(conn); err != nil {
-				conn.Close()
-			}
-		}
-		if err == nil {
-			if !c.setConn(conn) {
-				return nil
-			}
-			c.log.Info("amqp: reconnected", "attempts", attempt)
-			if c.opts.OnConnect != nil {
-				if err := c.opts.OnConnect(c.ctx, c); err != nil {
-					c.log.Error("amqp: OnConnect failed", "error", err)
-				}
-			}
-			return conn
-		}
-		if c.ctx.Err() != nil {
-			return nil
-		}
-		if c.opts.MaxRetries > 0 && attempt >= c.opts.MaxRetries {
-			c.log.Error("amqp: gave up reconnecting", "attempts", attempt, "error", err)
-			c.shutdown(fmt.Errorf("amqp: gave up reconnecting after %d attempts: %w", attempt, err))
-			if c.opts.OnFailed != nil {
-				c.opts.OnFailed(err)
-			}
-			return nil
-		}
-		c.log.Warn("amqp: reconnect failed", "attempt", attempt, "retry_in", interval, "error", err)
-		select {
-		case <-time.After(interval):
-		case <-c.ctx.Done():
-			return nil
-		}
-		interval = min(interval*2, c.opts.MaxReconnectInterval)
+// connect dials and recovers the topology, bounded by the connect timeout.
+func (c *Client) connect() (*Connection, error) {
+	timeout := c.opts.ConnectTimeout
+	if timeout <= 0 {
+		timeout = c.uri.ConnectTimeout
 	}
+	if timeout <= 0 {
+		timeout = defaultConnectTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
+	defer cancel()
+	conn, err := DialURI(ctx, c.uri, &c.opts.Config)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.recoverTopology(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+// backoff counts a failed attempt and waits before the next one. It
+// returns false if the client gave up or was closed.
+func (c *Client) backoff(failures *int, interval *time.Duration, err error) bool {
+	*failures++
+	if c.opts.MaxRetries > 0 && *failures >= c.opts.MaxRetries {
+		c.log.Error("amqp: gave up reconnecting", "attempts", *failures, "error", err)
+		c.shutdown(fmt.Errorf("amqp: gave up reconnecting after %d attempts: %w", *failures, err))
+		if c.opts.OnFailed != nil {
+			c.opts.OnFailed(err)
+		}
+		return false
+	}
+	c.log.Warn("amqp: reconnect failed", "attempt", *failures, "retry_in", *interval, "error", err)
+	select {
+	case <-time.After(*interval):
+	case <-c.ctx.Done():
+		return false
+	}
+	*interval = min(*interval*2, c.opts.MaxReconnectInterval)
+	return true
 }
 
 // recoverTopology redeclares exchanges, queues and bindings on a new
@@ -471,14 +528,16 @@ func (c *Client) onReturn(r *Return) {
 		"reply_code", r.ReplyCode, "reply_text", r.ReplyText)
 }
 
-// isConnectionLost reports whether err is caused by a lost connection, or
-// a channel closed by another operation, as opposed to an exception from
-// the broker caused by the operation itself. The operation can then be
-// retried.
+// isConnectionLost reports whether err is caused by a lost or closed
+// connection (also when the broker closed it, e.g. 320 CONNECTION_FORCED),
+// or a channel closed by another operation, as opposed to an exception
+// from the broker caused by the operation itself. The operation can then be
+// retried, after a reconnect if necessary.
 func isConnectionLost(err error) bool {
 	var ce *closedError
 	var de *discardedError
-	return errors.As(err, &ce) || errors.As(err, &de)
+	var e *Error
+	return errors.As(err, &ce) || errors.As(err, &de) || errors.As(err, &e) && e.Connection
 }
 
 // withChannel runs fn on the operations channel. If the connection is lost
@@ -548,6 +607,9 @@ func (c *Client) Publish(ctx context.Context, exchange, routingKey string, msg M
 	if err != nil {
 		return err
 	}
+	if err := c.checkExchange(ctx, exchange); err != nil {
+		return err
+	}
 	for {
 		ch, err := c.pub.get(ctx)
 		if err != nil {
@@ -560,8 +622,33 @@ func (c *Client) Publish(ctx context.Context, exchange, routingKey string, msg M
 			}
 			return err
 		}
-		return conf.Wait(ctx)
+		err = conf.Wait(ctx)
+		if IsCode(ch.Err(), NotFound) {
+			c.knownExchanges.Clear() // one was deleted, check them again
+		}
+		return err
 	}
+}
+
+// checkExchange makes sure an exchange exists before publishing to it the
+// first time. Publishing to a missing exchange makes the broker close the
+// shared publish channel, which would fail other publishes in flight.
+// Checking it with a passive declaration on the operations channel
+// instead keeps the publish channel open.
+func (c *Client) checkExchange(ctx context.Context, name string) error {
+	if name == "" {
+		return nil // the default exchange
+	}
+	if _, ok := c.knownExchanges.Load(name); ok {
+		return nil
+	}
+	err := c.withChannel(ctx, func(ch *Channel) error {
+		return ch.ExchangeDeclare(ctx, name, Direct, ExchangeDeclareOptions{Passive: true})
+	})
+	if err == nil {
+		c.knownExchanges.Store(name, struct{}{})
+	}
+	return err
 }
 
 // Queue declares a queue and returns a handle to it. The queue (and its
@@ -624,6 +711,7 @@ func (c *Client) Exchange(ctx context.Context, name, kind string, opts *Exchange
 	if err := c.withChannel(ctx, func(ch *Channel) error { return x.declare(ctx, ch) }); err != nil {
 		return nil, err
 	}
+	c.knownExchanges.Store(name, struct{}{})
 	if !o.Passive {
 		c.topoMu.Lock()
 		c.exchanges[name] = x
@@ -714,6 +802,43 @@ func (c *Client) removeExchangeBinding(b exchangeBinding) {
 	c.xbindings = bs
 }
 
+// managesQueue reports whether q is declared through the client and not
+// deleted.
+func (c *Client) managesQueue(q *Queue) bool {
+	c.topoMu.Lock()
+	defer c.topoMu.Unlock()
+	for _, old := range c.queues {
+		if old == q {
+			return true
+		}
+	}
+	return false
+}
+
+// redeclareQueue declares a queue the broker deleted again, with its
+// bindings.
+func (c *Client) redeclareQueue(ctx context.Context, q *Queue) error {
+	c.topoMu.Lock()
+	var bindings []queueBinding
+	for _, b := range c.qbindings {
+		if b.q == q {
+			bindings = append(bindings, b)
+		}
+	}
+	c.topoMu.Unlock()
+	return c.withChannel(ctx, func(ch *Channel) error {
+		if err := q.declare(ctx, ch); err != nil {
+			return err
+		}
+		for _, b := range bindings {
+			if err := ch.QueueBind(ctx, q.Name(), b.exchange, b.routingKey, b.args); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (c *Client) removeQueue(q *Queue) {
 	c.topoMu.Lock()
 	defer c.topoMu.Unlock()
@@ -739,6 +864,7 @@ func (c *Client) removeExchange(name string) {
 	c.topoMu.Lock()
 	defer c.topoMu.Unlock()
 	delete(c.exchanges, name)
+	c.knownExchanges.Delete(name)
 	bs := c.qbindings[:0]
 	for _, b := range c.qbindings {
 		if b.exchange != name {

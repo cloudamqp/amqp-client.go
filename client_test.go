@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -675,5 +676,244 @@ func TestSubscriptionCancelFromHandler(t *testing.T) {
 	n, err := q.Purge(ctx)
 	if err != nil || n != 2 {
 		t.Fatalf("expected 2 messages left, got %d %v", n, err)
+	}
+}
+
+// Issue #1
+func TestClientRecoversFromForcedClose(t *testing.T) {
+	p := newProxy(t)
+	c := newTestClient(t, p.url(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, randomName("test-forced"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Delete(ctx, QueueDeleteOptions{})
+	handler, bodies := collect(10)
+	subs := make([]*Subscription, 20)
+	for i := range subs {
+		if subs[i], err = q.Subscribe(ctx, handler, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for range 3 {
+		p.forceClose()
+		// Operations wait for the reconnect instead of failing with 320
+		var wg sync.WaitGroup
+		for range 10 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if _, err := c.Queue(ctx, "", nil); err != nil {
+					t.Error(err)
+				}
+			}()
+		}
+		wg.Wait()
+	}
+	if err := q.Publish(ctx, Message{Body: "after"}); err != nil {
+		t.Fatal(err)
+	}
+	receive(t, bodies, 1)
+	for _, s := range subs {
+		if s.Err() != nil {
+			t.Fatalf("subscription stopped: %v", s.Err())
+		}
+	}
+}
+
+// Issue #3
+func TestClientPublishToMissingExchangeDoesntFailOthers(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	var failed atomic.Int32
+	for i := range 200 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if i == 100 {
+				if err := c.Publish(ctx, randomName("missing"), "", Message{Body: "bad"}); !IsCode(err, NotFound) {
+					t.Errorf("expected not found, got %v", err)
+				}
+				return
+			}
+			if err := q.Publish(ctx, Message{Body: "good"}); err != nil {
+				failed.Add(1)
+				t.Log(err)
+			}
+		}()
+	}
+	wg.Wait()
+	if failed.Load() > 0 {
+		t.Fatalf("%d good publishes failed", failed.Load())
+	}
+}
+
+// Issue #4
+func TestClientOnConnectLosesConnection(t *testing.T) {
+	p := newProxy(t)
+	var calls atomic.Int32
+	cut := make(chan struct{})
+	returned := make(chan error, 1)
+	c := newTestClient(t, p.url(), &ClientOptions{
+		OnConnect: func(ctx context.Context, c *Client) error {
+			if calls.Add(1) != 2 {
+				return nil
+			}
+			close(cut)
+			time.Sleep(300 * time.Millisecond)
+			_, err := c.Queue(ctx, "", nil)
+			returned <- err
+			return err
+		},
+	})
+	p.cut()
+	<-cut
+	p.cut() // while OnConnect runs
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("OnConnect didn't return")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.Queue(ctx, "", nil); err != nil {
+		t.Fatalf("the client didn't reconnect: %v", err)
+	}
+}
+
+// Issue #5
+func TestClientReconnectTimesOut(t *testing.T) {
+	requireBroker(t)
+	u, _ := ParseURI(testURL())
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			c, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close() // accept, but never answer
+		}
+	}()
+	var dials atomic.Int32
+	var first atomic.Pointer[net.Conn]
+	failed := make(chan error, 1)
+	newTestClient(t, testURL(), &ClientOptions{
+		Config: Config{
+			ConnectTimeout: 200 * time.Millisecond,
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				var d net.Dialer
+				if dials.Add(1) == 1 {
+					c, err := d.DialContext(ctx, network, u.Addr())
+					if err == nil {
+						first.Store(&c)
+					}
+					return c, err
+				}
+				return d.DialContext(ctx, network, silent.Addr().String())
+			},
+		},
+		MaxRetries: 2,
+		OnFailed:   func(err error) { failed <- err },
+	})
+	(*first.Load()).Close()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the client to give up")
+	}
+}
+
+// Issue #6
+func TestClientBacksOffWhenConnectionsFlap(t *testing.T) {
+	p := newProxy(t)
+	var connects atomic.Int32
+	failed := make(chan error, 1)
+	newTestClient(t, p.url(), &ClientOptions{
+		ReconnectInterval:    100 * time.Millisecond,
+		MaxReconnectInterval: time.Second,
+		MaxRetries:           3,
+		OnConnect:            func(ctx context.Context, c *Client) error { connects.Add(1); return nil },
+		OnFailed:             func(err error) { failed <- err },
+	})
+	p.mu.Lock()
+	p.lifetime = 50 * time.Millisecond
+	p.mu.Unlock()
+	p.cut()
+	select {
+	case <-failed:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("expected the client to give up, it connected %d times", connects.Load())
+	}
+	if n := connects.Load(); n > 4 {
+		t.Fatalf("expected at most 4 connections, got %d", n)
+	}
+}
+
+// Issue #7
+func TestSubscriptionOnAutoDeleteQueueRecoversFromChannelError(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	x, err := c.Exchange(ctx, randomName("test-autodelete"), Fanout, &ExchangeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Delete(ctx, false)
+	q, err := c.Queue(ctx, "", nil) // exclusive and auto-delete
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Bind(ctx, x.Name(), "", nil); err != nil {
+		t.Fatal(err)
+	}
+	handler, bodies := collect(10)
+	var once sync.Once
+	sub, err := q.Subscribe(ctx, func(ctx context.Context, d *Delivery) error {
+		once.Do(func() {
+			d.Channel().BasicAck(d.DeliveryTag+1000, false) // 406 closes the channel
+			<-d.Channel().Done()
+		})
+		return handler(ctx, d)
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := x.Publish(ctx, "", Message{Body: "first"}); err != nil {
+		t.Fatal(err)
+	}
+	receive(t, bodies, 1)
+	// The queue was redeclared with its binding
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		// RabbitMQ nacks messages routed to a queue while it's deleted, or
+		// even closes the connection (506 RESOURCE_ERROR)
+		if err := x.Publish(ctx, "", Message{Body: "second"}); err != nil &&
+			!errors.Is(err, ErrPublishNacked) && !errors.Is(err, ErrUnconfirmed) {
+			t.Fatal(err)
+		}
+		select {
+		case b := <-bodies:
+			if b != "second" {
+				t.Fatalf("unexpected %q", b)
+			}
+			if sub.Err() != nil {
+				t.Fatal(sub.Err())
+			}
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+		if sub.Err() != nil || time.Now().After(deadline) {
+			t.Fatalf("subscription didn't recover: %v", sub.Err())
+		}
 	}
 }

@@ -327,12 +327,16 @@ func (ch *Channel) shutdown(err error) {
 		ch.consMu.Unlock()
 
 		ch.confMu.Lock()
+		// The fate of unconfirmed messages is unknown. A broker exception
+		// may have been caused by any message on the channel, so it's not
+		// returned as is, it would look like each message's own failure.
+		unconfErr := &unconfirmedError{err}
 		if ch.uhead < len(ch.unconfirmed) {
-			ch.confErr = err
+			ch.confErr = unconfErr
 		}
 		for _, u := range ch.unconfirmed[ch.uhead:] {
 			if u.conf != nil {
-				u.conf.resolve(false, err)
+				u.conf.resolve(false, unconfErr)
 			}
 		}
 		ch.unconfirmed, ch.uhead = nil, 0
@@ -371,16 +375,9 @@ func (ch *Channel) frameError(reason string) error {
 // handleFrame processes a frame for the channel, called from the
 // connection's read loop. A returned error closes the connection.
 func (ch *Channel) handleFrame(typ byte, payload []byte) error {
-	if ch.closing.Load() {
-		// Discard everything but close and close-ok while closing
-		if typ != frameMethod || len(payload) < 4 {
-			return nil
-		}
-		if cm := be.Uint32(payload); cm != channelClose && cm != channelCloseOk {
-			return nil
-		}
-		ch.pend = pending{}
-	}
+	// Frames are processed as usual while closing: the broker answers
+	// requests and confirms publishes sent before channel.close, only
+	// deliveries are dropped (see contentComplete).
 	switch typ {
 	case frameMethod:
 		if len(payload) < 4 {
@@ -625,6 +622,9 @@ func (ch *Channel) contentComplete() error {
 	switch p.kind {
 	case pendDeliver:
 		p.delivery.Body = p.body
+		if ch.closing.Load() {
+			return nil // can't be acknowledged, the broker requeues it
+		}
 		if c := p.consumer; c != nil && c.abandoned {
 			if !c.noAck {
 				return ignoreClosed(ch.BasicNack(p.delivery.DeliveryTag, false, true))
@@ -761,9 +761,10 @@ func (c *Confirmation) Acked() bool {
 }
 
 // Wait waits for the confirmation. It returns nil if the broker acked the
-// message, ErrPublishNacked if it was nacked, or the channel's error if it
-// closed before the message was confirmed (then the message may or may not
-// have been delivered).
+// message, ErrPublishNacked if it was nacked, or an error matching
+// ErrUnconfirmed (and ErrClosed) if the channel closed before the message
+// was confirmed. The message may or may not have been routed then, and
+// [Channel.Err] tells why the channel closed.
 func (c *Confirmation) Wait(ctx context.Context) error {
 	select {
 	case <-c.done:
@@ -929,7 +930,8 @@ func (ch *Channel) ConfirmSelect(ctx context.Context) error {
 
 // WaitForConfirms waits until all messages published on the channel before
 // the call are confirmed. It returns ErrPublishNacked if any message was
-// nacked since the previous call.
+// nacked since the previous call, and an error matching ErrUnconfirmed if
+// the channel closed with messages unconfirmed.
 func (ch *Channel) WaitForConfirms(ctx context.Context) error {
 	if !ch.confirmMode.Load() {
 		return ErrNoConfirmMode

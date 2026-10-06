@@ -203,6 +203,7 @@ func (s *Subscription) monitor(cons *Consumer) {
 		if !isConnectionLost(cause) {
 			s.c.log.Warn("amqp: consumer stopped, resubscribing", "queue", s.q.Name(), "error", cause)
 		}
+		redeclared := false
 		for {
 			var next *Consumer
 			var err error
@@ -234,6 +235,16 @@ func (s *Subscription) monitor(cons *Consumer) {
 			}
 			if s.ctx.Err() != nil {
 				return
+			}
+			if IsCode(err, NotFound) && !redeclared && s.c.managesQueue(s.q) {
+				// An auto-delete queue is deleted when its last consumer's
+				// channel closes, and an exclusive queue if the broker
+				// deleted it, declare it again with its bindings
+				redeclared = true
+				if err = s.c.redeclareQueue(s.ctx, s.q); err == nil {
+					s.c.log.Info("amqp: queue was deleted, redeclared it", "queue", s.q.Name())
+					continue
+				}
 			}
 			if !isConnectionLost(err) {
 				// E.g. the queue was deleted

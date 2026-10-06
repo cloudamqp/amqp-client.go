@@ -21,6 +21,8 @@ const (
 	defaultFrameMax   = 131072
 	defaultChannelMax = 2047
 	closeTimeout      = 10 * time.Second
+	// defaultConnectTimeout bounds the Client's reconnect attempts.
+	defaultConnectTimeout = 30 * time.Second
 )
 
 // Config holds the optional settings for a connection. Settings in the URI
@@ -38,6 +40,10 @@ type Config struct {
 	// ChannelMax is the maximum number of open channels, defaults to 2047.
 	// The smaller of the client's and broker's values is used.
 	ChannelMax uint16
+	// ConnectTimeout bounds the TCP connect, TLS handshake and AMQP
+	// handshake, in addition to the context passed to Dial. Defaults to
+	// the URI's connection_timeout, and for the Client's reconnects to 30s.
+	ConnectTimeout time.Duration
 	// TLSConfig is used for amqps:// URIs. ServerName defaults to the host.
 	TLSConfig *tls.Config
 	// Dial overrides how the network connection is established, e.g. to
@@ -147,9 +153,12 @@ func DialURI(ctx context.Context, u URI, cfg *Config) (*Connection, error) {
 	if c.Logger == nil {
 		c.Logger = slog.Default()
 	}
-	if u.ConnectTimeout > 0 {
+	if c.ConnectTimeout <= 0 {
+		c.ConnectTimeout = u.ConnectTimeout
+	}
+	if c.ConnectTimeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, u.ConnectTimeout)
+		ctx, cancel = context.WithTimeout(ctx, c.ConnectTimeout)
 		defer cancel()
 	}
 

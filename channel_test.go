@@ -441,8 +441,13 @@ func TestConfirmsFailOnChannelClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Wait(ctx); !IsCode(err, NotFound) {
-		t.Fatalf("expected not found, got %v", err)
+	// The confirmation doesn't claim the error as its own, another message
+	// could have caused it
+	if err := c.Wait(ctx); !errors.Is(err, ErrUnconfirmed) || !errors.Is(err, ErrClosed) || IsCode(err, NotFound) {
+		t.Fatalf("expected ErrUnconfirmed, got %v", err)
+	}
+	if !IsCode(ch.Err(), NotFound) {
+		t.Fatalf("expected the channel to be closed with not found, got %v", ch.Err())
 	}
 }
 
@@ -457,8 +462,8 @@ func TestWaitForConfirmsChannelClosed(t *testing.T) {
 		ch.BasicPublish(ctx, randomName("no-such-exchange"), "", Publishing{Body: []byte("x")})
 	}
 	<-ch.Done()
-	if err := ch.WaitForConfirms(ctx); !IsCode(err, NotFound) {
-		t.Fatalf("expected not found, got %v", err)
+	if err := ch.WaitForConfirms(ctx); !errors.Is(err, ErrUnconfirmed) {
+		t.Fatalf("expected ErrUnconfirmed, got %v", err)
 	}
 }
 
@@ -746,5 +751,43 @@ func TestBlockedPublishWaitsForContext(t *testing.T) {
 	conn.handleConnectionMethod(connectionUnblocked, decoder{})
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Issue #2
+func TestChannelCloseKeepsConfirms(t *testing.T) {
+	conn := dialTest(t, nil)
+	ch := openChannel(t, conn)
+	ctx := testContext(t)
+	q := tempQueue(t, ch)
+	const n = 5000
+	confs := make([]*Confirmation, 0, n)
+	for range n {
+		c, err := ch.BasicPublishConfirm(ctx, "", q, Publishing{Body: []byte("x")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		confs = append(confs, c)
+	}
+	if err := ch.Close(); err != nil {
+		t.Fatal(err)
+	}
+	acked := 0
+	for _, c := range confs {
+		err := c.Wait(ctx)
+		switch {
+		case err == nil:
+			acked++
+		case !errors.Is(err, ErrUnconfirmed):
+			t.Fatalf("unexpected error %v", err)
+		}
+	}
+	info, err := openChannel(t, conn).QueueDeclare(ctx, q, QueueDeclareOptions{Passive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("%d acked, %d in the queue", acked, info.MessageCount)
+	if acked == 0 || uint32(acked) > info.MessageCount {
+		t.Fatalf("%d acked but %d in the queue", acked, info.MessageCount)
 	}
 }

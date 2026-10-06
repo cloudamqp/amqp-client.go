@@ -57,9 +57,9 @@ err = events.Publish(ctx, "jobs.created", amqp.Message{
 })
 ```
 
-`Publish` returns once the broker has confirmed the message. Publish from several goroutines to get a higher throughput, because the confirms are pipelined on a shared channel.
+`Publish` returns once the broker has confirmed the message. Publish from several goroutines to get a higher throughput, because the confirms are pipelined on a shared channel. The first publish to an exchange the client hasn't declared checks that it exists, so that publishing to a missing exchange fails on its own instead of closing the shared channel for every publish in flight.
 
-While the client is reconnecting, operations wait until the connection is back or their context is done. If a connection is lost after a message is sent but before it's confirmed, `Publish` returns an error. The message may or may not have reached the broker.
+While the client is reconnecting, operations wait until the connection is back or their context is done. If the channel or connection is lost after a message is sent but before it's confirmed, `Publish` returns an error that matches `amqp.ErrUnconfirmed`. The message may or may not have reached the broker.
 
 ### Reconnection
 
@@ -76,7 +76,9 @@ c, err := amqp.NewClient(ctx, url, &amqp.ClientOptions{
 })
 ```
 
-When the client reconnects, it declares exchanges, queues and bindings again. A server-named queue gets a new name, and `Queue.Name()` returns the new one. Subscriptions consume again, also after their channel is closed while the connection stays up, for example after a consumer timeout. Messages that were in process when the connection was lost are redelivered, so make handlers idempotent.
+Each reconnect attempt times out after `Config.ConnectTimeout` (30s by default). A connection that the broker closes soon after it's established, for example because of a connection limit, counts as a failed attempt, so the backoff and `MaxRetries` apply.
+
+When the client reconnects, it declares exchanges, queues and bindings again. A server-named queue gets a new name, and `Queue.Name()` returns the new one. Subscriptions consume again, also after their channel is closed while the connection stays up, for example after a consumer timeout. If the broker has deleted the queue in the meantime (an auto-delete queue is deleted when its last consumer goes away), it's declared again with its bindings. Messages that were in process when the connection was lost are redelivered, so make handlers idempotent.
 
 ### Codecs
 

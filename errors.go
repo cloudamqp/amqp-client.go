@@ -23,6 +23,11 @@ var (
 	// cancelled, e.g. because its queue was deleted.
 	ErrConsumerCancelledByServer = errors.New("amqp: consumer cancelled by the broker")
 
+	// ErrUnconfirmed is matched by the error for a published message whose
+	// channel closed before the broker confirmed it. The message may or may
+	// not have been routed. The error also matches ErrClosed.
+	ErrUnconfirmed = errors.New("amqp: channel closed before the message was confirmed")
+
 	// ErrNoConfirmMode is returned when waiting for confirms on a channel
 	// that isn't in confirm mode.
 	ErrNoConfirmMode = errors.New("amqp: channel is not in confirm mode")
@@ -85,6 +90,27 @@ func (e *discardedError) Error() string {
 	return "amqp: channel closed by an earlier operation: " + e.cause.Error()
 }
 func (e *discardedError) Is(target error) bool { return target == ErrClosed }
+
+// unconfirmedError is the error for a message that wasn't confirmed before
+// its channel closed. A broker exception is only included in the message,
+// as another message on the channel might have caused it; a network error
+// is unwrapped.
+type unconfirmedError struct{ cause error }
+
+func (e *unconfirmedError) Error() string {
+	return ErrUnconfirmed.Error() + ": " + e.cause.Error()
+}
+
+func (e *unconfirmedError) Is(target error) bool {
+	return target == ErrUnconfirmed || target == ErrClosed
+}
+
+func (e *unconfirmedError) Unwrap() error {
+	if _, ok := e.cause.(*Error); ok {
+		return nil
+	}
+	return e.cause
+}
 
 func unexpectedMethod(cm uint32) *Error {
 	return &Error{Code: UnexpectedFrame, Reason: "unexpected " + methodName(cm),
