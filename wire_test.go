@@ -190,8 +190,9 @@ func TestCodecs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if enc != "" && enc != "identity" && bytes.Contains(b, []byte(`{"A":42}`)) {
-			t.Fatalf("%s: expected encoded data", enc)
+		// Tiny inputs may be stored uncompressed, so check the headers
+		if enc == "gzip" && !bytes.HasPrefix(b, []byte{0x1f, 0x8b}) || enc == "deflate" && b[0] != 0x78 {
+			t.Fatalf("%s: expected encoded data, got %x", enc, b)
 		}
 		var out v
 		if err := c.Unmarshal(b, &p, &out); err != nil || out.A != 42 {
