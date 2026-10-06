@@ -1,9 +1,12 @@
 package amqp
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
 	"strings"
 	"sync"
@@ -915,5 +918,107 @@ func TestSubscriptionOnAutoDeleteQueueRecoversFromChannelError(t *testing.T) {
 		if sub.Err() != nil || time.Now().After(deadline) {
 			t.Fatalf("subscription didn't recover: %v", sub.Err())
 		}
+	}
+}
+
+// Issue #13
+func TestClientGetSurvivesFailedOperations(t *testing.T) {
+	c := newTestClient(t, testURL(), nil)
+	ctx := testContext(t)
+	q, err := c.Queue(ctx, "", &QueueOptions{Exclusive: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Publish(ctx, Message{Body: "x"}); err != nil {
+		t.Fatal(err)
+	}
+	d, ok, err := q.Get(ctx, false)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	// Failures that close the operations channel
+	c.Queue(ctx, randomName("missing"), &QueueOptions{Passive: true})
+	c.Publish(ctx, randomName("missing"), "", Message{Body: "x"})
+	if err := d.Ack(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if _, ok, err := q.Get(ctx, true); ok || err != nil {
+		t.Fatalf("expected the message to be acked, got ok=%v err=%v", ok, err)
+	}
+}
+
+// Issue #14
+func TestClientOnConnectQueuesDontPileUp(t *testing.T) {
+	p := newProxy(t)
+	connected := make(chan struct{}, 10)
+	c := newTestClient(t, p.url(), &ClientOptions{
+		OnConnect: func(ctx context.Context, c *Client) error {
+			_, err := c.Queue(ctx, "", nil)
+			connected <- struct{}{}
+			return err
+		},
+	})
+	<-connected
+	for range 3 {
+		p.cut()
+		select {
+		case <-connected:
+		case <-time.After(5 * time.Second):
+			t.Fatal("expected a reconnect")
+		}
+	}
+	c.topoMu.Lock()
+	n := len(c.queues)
+	c.topoMu.Unlock()
+	if n != 0 {
+		t.Fatalf("expected the queues declared in OnConnect not to be recovered, got %d", n)
+	}
+}
+
+// Issue #14
+func TestSubscribeRacingClose(t *testing.T) {
+	client, server := net.Pipe()
+	f := &fakeBroker{t: t, conn: server, br: bufio.NewReader(server), quit: make(chan struct{})}
+	go func() {
+		if f.handshake(nil) != nil {
+			return
+		}
+		ch := f.openChannel()
+		f.expect(basicQos)
+		f.method(ch, basicQosOk, nil)
+		f.expect(basicConsume)
+		f.expect(connectionClose) // hold consume-ok until the client closes
+		f.method(ch, basicConsumeOk, appendShortStr(nil, "t"))
+		f.method(0, connectionCloseOk, nil)
+		io.Copy(io.Discard, server)
+	}()
+	defer server.Close()
+	dialed := false
+	c, err := NewClient(context.Background(), "amqp://localhost", &ClientOptions{
+		Config: Config{
+			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				if dialed {
+					return nil, errors.New("no reconnects")
+				}
+				dialed = true
+				return client, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := &Queue{c: c}
+	name := "q"
+	q.name.Store(&name)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		c.Close()
+	}()
+	_, err = q.Subscribe(context.Background(), func(ctx context.Context, d *Delivery) error { return nil }, nil)
+	if !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed from a subscribe that raced Close, got %v", err)
 	}
 }

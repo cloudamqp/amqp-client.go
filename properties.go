@@ -41,6 +41,7 @@ const (
 	flagUserID          = 0x0010
 	flagAppID           = 0x0008
 	flagClusterID       = 0x0004
+	flagContinuation    = 0x0001
 )
 
 func (p *Properties) validate() error {
@@ -169,10 +170,19 @@ func cached(b []byte, last *string) string {
 	return *last
 }
 
-func (d *decoder) properties(p *Properties, cache *propCache) {
+// properties decodes a property list. A headers table that can't be
+// decoded is skipped and its error returned, the other properties are
+// still decoded.
+func (d *decoder) properties(p *Properties, cache *propCache) (headersErr error) {
 	flags := d.u16()
-	if flags == 0 {
-		return
+	// Further flag words follow while the continuation bit is set. They're
+	// for properties this client doesn't know, which come after the known
+	// ones and are ignored.
+	for f := flags; f&flagContinuation != 0 && d.err == nil; {
+		f = d.u16()
+	}
+	if flags&^flagContinuation == 0 {
+		return nil
 	}
 	if flags&flagContentType != 0 {
 		p.ContentType = cached(d.shortStrBytes(), &cache.contentType)
@@ -181,7 +191,7 @@ func (d *decoder) properties(p *Properties, cache *propCache) {
 		p.ContentEncoding = cached(d.shortStrBytes(), &cache.contentEncoding)
 	}
 	if flags&flagHeaders != 0 {
-		p.Headers = d.table()
+		p.Headers, headersErr = d.tableLenient()
 	}
 	if flags&flagDeliveryMode != 0 {
 		p.DeliveryMode = d.u8()
@@ -216,4 +226,5 @@ func (d *decoder) properties(p *Properties, cache *propCache) {
 	if flags&flagClusterID != 0 {
 		d.shortStrBytes() // deprecated, ignored
 	}
+	return headersErr
 }

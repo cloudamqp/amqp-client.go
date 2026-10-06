@@ -20,10 +20,12 @@ import (
 const (
 	defaultFrameMax   = 131072
 	defaultChannelMax = 2047
-	closeTimeout      = 10 * time.Second
 	// defaultConnectTimeout bounds the Client's reconnect attempts.
 	defaultConnectTimeout = 30 * time.Second
 )
+
+// closeTimeout is how long Close waits for the broker's close-ok.
+var closeTimeout = 10 * time.Second
 
 // Config holds the optional settings for a connection. Settings in the URI
 // query string are used for the fields left unset here.
@@ -67,9 +69,9 @@ type Config struct {
 
 // Connection is an AMQP connection. It's safe for concurrent use.
 //
-// All writes go through a buffered writer. Frames are flushed to the
-// socket by a background goroutine as soon as possible, which coalesces
-// frames written concurrently, or in quick succession, into fewer syscalls.
+// Frames are appended to a write buffer and written to the socket by a
+// background goroutine, which coalesces frames written concurrently, or in
+// quick succession, into fewer syscalls (see writer.go).
 type Connection struct {
 	conn net.Conn
 	rd   *deadlineReader
@@ -79,12 +81,7 @@ type Connection struct {
 	pendingDiscard int
 	readBuf        []byte // for frames larger than br's buffer
 
-	wmu     sync.Mutex
-	bw      *bufio.Writer
-	werr    error // sticky write error, guarded by wmu
-	dirty   bool  // unflushed data in bw, guarded by wmu
-	flushCh chan struct{}
-	wrote   atomic.Bool // written since the last heartbeat tick
+	writer
 
 	uri         URI
 	cfg         Config
@@ -102,10 +99,13 @@ type Connection struct {
 	blocked   atomic.Bool
 	unblocked chan struct{} // closed when the block is lifted
 
-	ctrlMu         sync.Mutex // serializes UpdateSecret
-	updateSecretOk chan struct{}
-	closing        atomic.Bool
-	cause          atomic.Pointer[error] // why the connection is being closed
+	// update-secret requests are numbered, replies arrive in order
+	secretMu   sync.Mutex
+	secretSent uint64
+	secretOk   uint64
+	secretCh   chan struct{} // closed when secretOk increases
+	closing    atomic.Bool
+	cause      atomic.Pointer[error] // why the connection is being closed
 
 	done chan struct{}
 	err  error // set before done is closed
@@ -217,16 +217,14 @@ func (r *deadlineReader) Read(p []byte) (int, error) {
 func open(ctx context.Context, nc net.Conn, u URI, cfg Config) (*Connection, error) {
 	rd := &deadlineReader{conn: nc}
 	c := &Connection{
-		conn:           nc,
-		rd:             rd,
-		br:             bufio.NewReaderSize(rd, int(cfg.FrameMax)+frameOverhead),
-		bw:             bufio.NewWriterSize(nc, int(cfg.FrameMax)+frameOverhead),
-		flushCh:        make(chan struct{}, 1),
-		uri:            u,
-		cfg:            cfg,
-		logger:         cfg.Logger,
-		updateSecretOk: make(chan struct{}, 1),
-		done:           make(chan struct{}),
+		conn:     nc,
+		rd:       rd,
+		br:       bufio.NewReaderSize(rd, int(cfg.FrameMax)+frameOverhead),
+		uri:      u,
+		cfg:      cfg,
+		logger:   cfg.Logger,
+		secretCh: make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 
 	// Abort the handshake when the context is done.
@@ -242,6 +240,7 @@ func open(ctx context.Context, nc net.Conn, u URI, cfg Config) (*Connection, err
 		return nil, err
 	}
 	nc.SetDeadline(time.Time{})
+	c.initWriter()
 
 	if c.heartbeat > 0 {
 		rd.timeout = 2 * c.heartbeat
@@ -466,9 +465,25 @@ func (c *Connection) readFrame() (typ byte, channel uint16, payload []byte, err 
 	typ = hdr[0]
 	channel = be.Uint16(hdr[1:3])
 	size := be.Uint32(hdr[3:7])
-	if c.frameMax != 0 && size > c.frameMax {
+	frameMax := c.frameMax
+	if frameMax == 0 { // still in the handshake
+		switch typ {
+		case frameMethod, frameHeartbeat:
+		case 'A':
+			// The broker replies with its protocol header if it doesn't
+			// support the client's version
+			if h, err := c.br.Peek(8); err == nil && string(h[:4]) == "AMQP" {
+				return 0, 0, nil, fmt.Errorf("amqp: the broker doesn't support AMQP 0-9-1, it supports %d-%d-%d", h[5], h[6], h[7])
+			}
+			fallthrough
+		default:
+			return 0, 0, nil, fmt.Errorf("amqp: not an AMQP 0-9-1 broker, it sent %q", hdr)
+		}
+		frameMax = max(c.cfg.FrameMax, minFrameMax)
+	}
+	if size > frameMax {
 		return 0, 0, nil, &Error{Code: FrameError, Connection: true,
-			Reason: fmt.Sprintf("frame size %d exceeds frame max %d", size, c.frameMax)}
+			Reason: fmt.Sprintf("frame size %d exceeds frame max %d", size, frameMax)}
 	}
 	n := 7 + int(size) + 1
 	var frame []byte
@@ -521,18 +536,22 @@ func (c *Connection) readLoop() {
 			continue
 		}
 		if err = ch.handleFrame(typ, payload); err != nil {
-			var e *Error
-			if errors.As(err, &e) && !e.Server {
-				// A protocol error detected by the client
-				c.writeMethod(0, connectionClose, true, func(b []byte) ([]byte, error) {
-					b = be.AppendUint16(b, e.Code)
-					b = appendShortStr(b, truncate(e.Reason, 255))
-					b = be.AppendUint16(b, e.ClassID)
-					return be.AppendUint16(b, e.MethodID), nil
-				})
-			}
 			break
 		}
+	}
+	var e *Error
+	if c.cause.Load() == nil && errors.As(err, &e) {
+		if !e.Server {
+			// A protocol error detected by the client, tell the broker
+			c.writeMethod(context.Background(), 0, connectionClose, true, func(b []byte) ([]byte, error) {
+				b = be.AppendUint16(b, e.Code)
+				b = appendShortStr(b, truncate(e.Reason, 255))
+				b = be.AppendUint16(b, e.ClassID)
+				return be.AppendUint16(b, e.MethodID), nil
+			})
+		}
+		// Send connection.close or close-ok before closing the socket
+		c.waitFlushed(time.Second)
 	}
 	if cause := c.cause.Load(); cause != nil {
 		err = *cause
@@ -555,7 +574,7 @@ func (c *Connection) handleConnectionMethod(cm uint32, d decoder) (stop bool, er
 	switch cm {
 	case connectionClose:
 		e := decodeClose(&d, true)
-		c.writeMethod(0, connectionCloseOk, true, nil)
+		c.writeMethod(context.Background(), 0, connectionCloseOk, true, nil)
 		return true, e
 	case connectionCloseOk:
 		if c.closing.Load() {
@@ -584,10 +603,11 @@ func (c *Connection) handleConnectionMethod(cm uint32, d decoder) (stop bool, er
 			c.cfg.OnUnblocked()
 		}
 	case connectionUpdateSecretOk:
-		select {
-		case c.updateSecretOk <- struct{}{}:
-		default:
-		}
+		c.secretMu.Lock()
+		c.secretOk++
+		close(c.secretCh)
+		c.secretCh = make(chan struct{})
+		c.secretMu.Unlock()
 	default:
 		return true, unexpectedMethod(cm)
 	}
@@ -619,105 +639,6 @@ func (c *Connection) teardown(err error) {
 func (c *Connection) abort(err error) {
 	c.cause.CompareAndSwap(nil, &err)
 	c.conn.Close()
-}
-
-func (c *Connection) heartbeatLoop() {
-	t := time.NewTicker(c.heartbeat / 2)
-	defer t.Stop()
-	hb := []byte{frameHeartbeat, 0, 0, 0, 0, 0, 0, frameEnd}
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-t.C:
-			if c.wrote.Swap(false) {
-				continue
-			}
-			c.wmu.Lock()
-			if c.werr == nil {
-				c.bw.Write(hb)
-				c.dirty = true
-				c.flushLocked()
-			}
-			c.wmu.Unlock()
-		}
-	}
-}
-
-func (c *Connection) flushLoop() {
-	for {
-		select {
-		case <-c.flushCh:
-		case <-c.done:
-			return
-		}
-		c.wmu.Lock()
-		c.flushLocked()
-		c.wmu.Unlock()
-	}
-}
-
-// flushLocked flushes buffered frames, c.wmu must be held.
-func (c *Connection) flushLocked() {
-	if !c.dirty || c.werr != nil {
-		return
-	}
-	c.dirty = false
-	if err := c.bw.Flush(); err != nil {
-		c.writeFailed(err)
-		return
-	}
-	c.wrote.Store(true)
-}
-
-// writeFailed records a write error and closes the socket, c.wmu must be held.
-func (c *Connection) writeFailed(err error) {
-	if c.werr == nil {
-		c.werr = &closedError{err}
-		c.abort(c.werr)
-	}
-}
-
-// doneWriting is called with c.wmu held after frames are written to the
-// buffer. It flushes now or schedules a flush.
-func (c *Connection) doneWriting(flush bool) {
-	c.dirty = true
-	if flush {
-		c.flushLocked()
-		return
-	}
-	select {
-	case c.flushCh <- struct{}{}:
-	default:
-	}
-}
-
-// writeMethod writes a method frame, fn appends the method's arguments.
-// With flush the frame is sent immediately, otherwise it's sent by the
-// background flusher, which batches frames.
-func (c *Connection) writeMethod(channel uint16, cm uint32, flush bool, fn func([]byte) ([]byte, error)) error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	if c.werr != nil {
-		return c.werr
-	}
-	b, start := beginMethod(c.bw.AvailableBuffer(), channel, cm)
-	if fn != nil {
-		var err error
-		if b, err = fn(b); err != nil {
-			return err
-		}
-	}
-	if size := len(b) - start; size > int(c.frameMax)-frameOverhead {
-		return fmt.Errorf("amqp: %s frame of %d bytes exceeds frame max %d", methodName(cm), size, c.frameMax)
-	}
-	b = endFrame(b, start)
-	if _, err := c.bw.Write(b); err != nil {
-		c.writeFailed(err)
-		return c.werr
-	}
-	c.doneWriting(flush)
-	return nil
 }
 
 func (c *Connection) channel(id uint16) *Channel {
@@ -781,7 +702,7 @@ func (c *Connection) CloseReason(reason string) error {
 	}
 	// Don't block forever on a peer that doesn't read
 	c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
-	err := c.writeMethod(0, connectionClose, true, func(b []byte) ([]byte, error) {
+	err := c.writeMethod(context.Background(), 0, connectionClose, true, func(b []byte) ([]byte, error) {
 		b = be.AppendUint16(b, ReplySuccess)
 		b = appendShortStr(b, truncate(reason, 255))
 		return append(b, 0, 0, 0, 0), nil
@@ -860,26 +781,36 @@ func (c *Connection) UpdateSecret(ctx context.Context, secret, reason string) er
 	if err := checkShortStr("reason", reason); err != nil {
 		return err
 	}
-	c.ctrlMu.Lock()
-	defer c.ctrlMu.Unlock()
-	select {
-	case <-c.updateSecretOk: // drain a stale reply
-	default:
+	if err := c.waitSpace(ctx); err != nil {
+		return err
 	}
-	err := c.writeMethod(0, connectionUpdateSecret, true, func(b []byte) ([]byte, error) {
+	// Number the request while writing it, the broker replies in order
+	c.secretMu.Lock()
+	err := c.writeMethod(ctx, 0, connectionUpdateSecret, true, func(b []byte) ([]byte, error) {
 		b = appendLongStr(b, secret)
 		return appendShortStr(b, reason), nil
 	})
 	if err != nil {
+		c.secretMu.Unlock()
 		return err
 	}
-	select {
-	case <-c.updateSecretOk:
-		return nil
-	case <-c.done:
-		return c.err
-	case <-ctx.Done():
-		return ctx.Err()
+	c.secretSent++
+	seq := c.secretSent
+	c.secretMu.Unlock()
+	for {
+		c.secretMu.Lock()
+		ok, changed := c.secretOk, c.secretCh
+		c.secretMu.Unlock()
+		if ok >= seq {
+			return nil
+		}
+		select {
+		case <-changed:
+		case <-c.done:
+			return c.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 

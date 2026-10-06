@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `NewGzip` and `NewDeflate` return encoders with a decoded size limit. `ErrDecodedTooLarge` is returned when a body decodes to more than that.
+
+### Changed
+
+- Frames are written to the socket by the flusher goroutine outside the write lock. A publish that waits for buffer space respects its context, and the read loop never waits for a write. ([#10](https://github.com/cloudamqp/amqp-client.go/issues/10))
+- Topology declared with the context passed to `OnConnect` isn't recovered automatically, as `OnConnect` declares it again, and subscriptions started with it end with their connection. ([#14](https://github.com/cloudamqp/amqp-client.go/issues/14))
+- `Gzip` and `Deflate` decode at most 128 MiB (`DefaultMaxDecodedSize`). ([#12](https://github.com/cloudamqp/amqp-client.go/issues/12))
+
+### Fixed
+
+- Deliveries to no-ack consumers were dropped when their channel closed, both buffered ones and those arriving while closing. ([#8](https://github.com/cloudamqp/amqp-client.go/issues/8))
+- A channel id was reused while the broker was still closing the channel after a close timeout, and the client's cancel-ok for an abandoned consumer the broker had cancelled closed the connection. ([#9](https://github.com/cloudamqp/amqp-client.go/issues/9))
+- A publish blocked on a stalled socket ignored its context and stalled the read loop. ([#10](https://github.com/cloudamqp/amqp-client.go/issues/10))
+- Headers with the 'U' field type are decoded, headers that can't be decoded are dropped (with a warning) instead of closing the connection, and the property flags continuation bit is honoured. ([#11](https://github.com/cloudamqp/amqp-client.go/issues/11))
+- Protocol limits are enforced when reading: the frame size during the handshake, the body size (no longer allocated up front), the nesting depth of field tables and the decompressed size. A broker replying with another protocol version, or a server that doesn't speak AMQP, gives a clear error, and frame errors are reported to the broker with `connection.close`. ([#12](https://github.com/cloudamqp/amqp-client.go/issues/12))
+- Acknowledging a no-ack delivery, or one already covered by `BasicAck`/`BasicNack` with multiple, returns `ErrAlreadyAcknowledged` instead of making the broker close the channel. `Queue.Get` uses its own channel, so failed operations no longer prevent acknowledging fetched messages. ([#13](https://github.com/cloudamqp/amqp-client.go/issues/13))
+- A subscription created while the client was closing was never stopped, server-named queues declared in `OnConnect` piled up in the recovery list, and `UpdateSecret` could return on the reply to an earlier, abandoned call. ([#14](https://github.com/cloudamqp/amqp-client.go/issues/14))
+
 ## [1.1.0] - 2026-10-06
 
 ### Added

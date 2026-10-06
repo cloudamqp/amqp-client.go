@@ -19,7 +19,25 @@ var (
 	// ErrUnsupportedContentEncoding is returned when no Encoder is
 	// registered for a message's content encoding.
 	ErrUnsupportedContentEncoding = errors.New("amqp: unsupported content encoding")
+	// ErrDecodedTooLarge is returned when a compressed body decodes to more
+	// than the encoder's limit, see [NewGzip].
+	ErrDecodedTooLarge = errors.New("amqp: decoded body exceeds the size limit")
 )
+
+// DefaultMaxDecodedSize is the decoded size limit of [Gzip] and [Deflate].
+const DefaultMaxDecodedSize = 128 << 20
+
+// readAllLimit reads r until EOF, failing if it yields more than limit bytes.
+func readAllLimit(r io.Reader, limit int64) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("%w of %d bytes", ErrDecodedTooLarge, limit)
+	}
+	return b, nil
+}
 
 // Serializer converts values to and from message bodies of a content type,
 // such as "application/json".
@@ -175,7 +193,10 @@ func (textSerializer) Unmarshal(data []byte, v any) error {
 // only decode into *string and *[]byte.
 var Text Serializer = textSerializer{}
 
-type gzipEncoder struct{ writers sync.Pool }
+type gzipEncoder struct {
+	limit   int64
+	writers sync.Pool
+}
 
 func (g *gzipEncoder) Encode(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
@@ -202,13 +223,23 @@ func (g *gzipEncoder) Decode(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return readAllLimit(r, g.limit)
 }
 
-// Gzip encodes bodies with gzip (RFC 1952).
-var Gzip Encoder = &gzipEncoder{}
+// Gzip encodes bodies with gzip (RFC 1952). It decodes at most
+// DefaultMaxDecodedSize bytes, protecting against compression bombs.
+var Gzip = NewGzip(DefaultMaxDecodedSize)
 
-type deflateEncoder struct{ writers sync.Pool }
+// NewGzip returns a gzip encoder that fails to decode bodies larger than
+// maxDecodedSize with ErrDecodedTooLarge.
+func NewGzip(maxDecodedSize int64) Encoder {
+	return &gzipEncoder{limit: maxDecodedSize}
+}
+
+type deflateEncoder struct {
+	limit   int64
+	writers sync.Pool
+}
 
 func (z *deflateEncoder) Encode(data []byte) ([]byte, error) {
 	var buf bytes.Buffer
@@ -235,9 +266,16 @@ func (z *deflateEncoder) Decode(data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer r.Close()
-	return io.ReadAll(r)
+	return readAllLimit(r, z.limit)
 }
 
 // Deflate encodes bodies with zlib-wrapped deflate (RFC 1950), which is
-// what HTTP's "deflate" content encoding means.
-var Deflate Encoder = &deflateEncoder{}
+// what HTTP's "deflate" content encoding means. It decodes at most
+// DefaultMaxDecodedSize bytes.
+var Deflate = NewDeflate(DefaultMaxDecodedSize)
+
+// NewDeflate returns a deflate encoder that fails to decode bodies larger
+// than maxDecodedSize with ErrDecodedTooLarge.
+func NewDeflate(maxDecodedSize int64) Encoder {
+	return &deflateEncoder{limit: maxDecodedSize}
+}

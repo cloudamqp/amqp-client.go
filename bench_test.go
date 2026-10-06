@@ -1,9 +1,7 @@
 package amqp
 
 import (
-	"bufio"
 	"context"
-	"io"
 	"testing"
 )
 
@@ -112,8 +110,8 @@ func BenchmarkConsume(b *testing.B) {
 // BenchmarkEncodePublish measures the client side cost of publishing,
 // without a broker.
 func BenchmarkEncodePublish(b *testing.B) {
-	c := &Connection{frameMax: defaultFrameMax, flushCh: make(chan struct{}, 1)}
-	c.bw = newDiscardWriter()
+	c := &Connection{frameMax: defaultFrameMax, done: make(chan struct{})}
+	c.initWriter()
 	ch := newChannel(c, 1)
 	ctx := context.Background()
 	msg := Publishing{Body: make([]byte, 100), Properties: Properties{
@@ -125,13 +123,16 @@ func BenchmarkEncodePublish(b *testing.B) {
 		if _, err := ch.publish(ctx, "amq.topic", "a.b.c", &msg, false); err != nil {
 			b.Fatal(err)
 		}
+		if len(c.wbuf) > 1<<16 {
+			c.wbuf = c.wbuf[:0] // as if flushed
+		}
 	}
 }
 
 // BenchmarkDecodeDeliver measures the client side cost of receiving a
 // message, without a broker.
 func BenchmarkDecodeDeliver(b *testing.B) {
-	c := &Connection{frameMax: defaultFrameMax, flushCh: make(chan struct{}, 1), done: make(chan struct{})}
+	c := &Connection{frameMax: defaultFrameMax, done: make(chan struct{})}
 	ch := newChannel(c, 1)
 	cons := newConsumer(ch, "q", true)
 	cons.tag = "ctag"
@@ -168,9 +169,3 @@ func BenchmarkDecodeDeliver(b *testing.B) {
 		}
 	}
 }
-
-func newDiscardWriter() *bufioWriter { return newBufioWriter(io.Discard) }
-
-type bufioWriter = bufio.Writer
-
-func newBufioWriter(w io.Writer) *bufio.Writer { return bufio.NewWriterSize(w, defaultFrameMax) }

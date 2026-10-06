@@ -52,6 +52,9 @@ type Channel struct {
 	confErr     error // set if the channel closed with unconfirmed messages
 
 	onReturn atomic.Pointer[func(*Return)]
+	// settledUpTo is the highest delivery tag acked or nacked with
+	// multiple, the deliveries up to it are settled.
+	settledUpTo atomic.Uint64
 }
 
 type rpcWaiter struct {
@@ -85,6 +88,9 @@ func (w *rpcWaiter) deliver(r rpcReply) bool {
 	}
 	return false
 }
+
+// maxBodyPrealloc is the largest body buffer allocated up front.
+const maxBodyPrealloc = 16 << 20
 
 type pendingKind uint8
 
@@ -171,11 +177,16 @@ func (ch *Channel) OnReturn(fn func(*Return)) {
 type callOpts struct {
 	consumer *Consumer
 	noAck    bool
-	onWrite  func() // called with conn.wmu held, right after the frame is written
+	onWrite  func() // called with conn.wmu held, when the frame is appended
 }
 
 // call sends a synchronous method and waits for the reply.
 func (ch *Channel) call(ctx context.Context, cm, expect uint32, o callOpts, fn func([]byte) ([]byte, error)) (rpcReply, error) {
+	// Wait for buffer space first, the frame is then written without
+	// waiting, as the read loop needs rpcMu
+	if err := ch.conn.waitSpace(ctx); err != nil {
+		return rpcReply{}, err
+	}
 	w := &rpcWaiter{req: cm, expect: expect, reply: make(chan rpcReply, 1), consumer: o.consumer, noAck: o.noAck}
 	ch.rpcMu.Lock()
 	select {
@@ -189,7 +200,7 @@ func (ch *Channel) call(ctx context.Context, cm, expect uint32, o callOpts, fn f
 		return rpcReply{}, ErrClosed
 	}
 	ch.waiters = append(ch.waiters, w)
-	if err := ch.write(cm, true, o.onWrite, fn); err != nil {
+	if err := ch.write(cm, o.onWrite, fn); err != nil {
 		ch.waiters = ch.waiters[:len(ch.waiters)-1]
 		ch.rpcMu.Unlock()
 		return rpcReply{}, err
@@ -208,35 +219,25 @@ func (ch *Channel) call(ctx context.Context, cm, expect uint32, o callOpts, fn f
 	}
 }
 
-func (ch *Channel) write(cm uint32, flush bool, onWrite func(), fn func([]byte) ([]byte, error)) error {
+// write writes a method frame without waiting for buffer space.
+func (ch *Channel) write(cm uint32, onWrite func(), fn func([]byte) ([]byte, error)) error {
 	c := ch.conn
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	if c.werr != nil {
-		return c.werr
+	b, err := c.beginWrite(context.Background(), 0, true)
+	if err != nil {
+		return err
 	}
 	if ch.wclosed && cm != channelCloseOk {
+		c.cancelWrite()
 		return ErrClosed
 	}
-	b, start := beginMethod(c.bw.AvailableBuffer(), ch.id, cm)
-	if fn != nil {
-		var err error
-		if b, err = fn(b); err != nil {
-			return err
-		}
-	}
-	if size := len(b) - start; size > int(c.frameMax)-frameOverhead {
-		return fmt.Errorf("amqp: %s frame of %d bytes exceeds frame max %d", methodName(cm), size, c.frameMax)
-	}
-	b = endFrame(b, start)
-	if _, err := c.bw.Write(b); err != nil {
-		c.writeFailed(err)
-		return c.werr
+	if b, err = c.appendMethod(b, ch.id, cm, fn); err != nil {
+		c.cancelWrite()
+		return err
 	}
 	if onWrite != nil {
 		onWrite()
 	}
-	c.doneWriting(flush)
+	c.endWrite(b)
 	return nil
 }
 
@@ -247,7 +248,7 @@ func (ch *Channel) send(cm uint32, fn func([]byte) ([]byte, error)) error {
 		return ch.err
 	default:
 	}
-	return ch.write(cm, false, nil, fn)
+	return ch.write(cm, nil, fn)
 }
 
 func (ch *Channel) open(ctx context.Context) error {
@@ -292,6 +293,8 @@ func (ch *Channel) CloseReason(code uint16, reason string) error {
 		return append(b, 0, 0, 0, 0), nil
 	})
 	if err == context.DeadlineExceeded {
+		// The id stays reserved until the broker's close-ok arrives, as the
+		// broker still has the channel open
 		ch.shutdown(ErrClosed)
 	}
 	<-ch.done
@@ -299,6 +302,7 @@ func (ch *Channel) CloseReason(code uint16, reason string) error {
 }
 
 // shutdown marks the channel as closed and fails everything waiting on it.
+// It doesn't free the channel id, see removeChannel.
 func (ch *Channel) shutdown(err error) {
 	ch.once.Do(func() {
 		ch.rpcMu.Lock()
@@ -321,7 +325,8 @@ func (ch *Channel) shutdown(err error) {
 
 		ch.consMu.Lock()
 		for tag, c := range ch.consumers {
-			c.close(err, true)
+			// Deliveries to no-ack consumers are already settled, keep them
+			c.close(err, !c.noAck)
 			delete(ch.consumers, tag)
 		}
 		ch.consMu.Unlock()
@@ -342,7 +347,6 @@ func (ch *Channel) shutdown(err error) {
 		ch.unconfirmed, ch.uhead = nil, 0
 		ch.confMu.Unlock()
 
-		ch.conn.removeChannel(ch)
 	})
 }
 
@@ -435,6 +439,9 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 		c := ch.lookupConsumer(tag)
 		if c != nil {
 			m.ConsumerTag = c.tag
+			if c.noAck {
+				m.acked.Store(true)
+			}
 		} else {
 			m.ConsumerTag = string(tag)
 		}
@@ -476,7 +483,11 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 	case basicCancel:
 		tag := d.shortStr()
 		noWait := d.u8()&1 != 0
-		if c := ch.removeConsumer(tag); c != nil {
+		ch.consMu.Lock()
+		c := ch.consumers[tag]
+		ch.consMu.Unlock()
+		if c != nil && !c.abandoned { // an abandoned one waits for its cancel-ok
+			ch.removeConsumer(tag)
 			c.close(ErrConsumerCancelledByServer, false)
 		}
 		if !noWait {
@@ -488,8 +499,9 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 	case channelClose:
 		e := decodeClose(d, false)
 		ch.closing.Store(true)
-		ch.write(channelCloseOk, true, func() { ch.wclosed = true }, nil)
+		ch.write(channelCloseOk, func() { ch.wclosed = true }, nil)
 		ch.shutdown(e)
+		ch.conn.removeChannel(ch)
 		return nil
 	case channelCloseOk:
 		// Fail requests the broker discarded while closing
@@ -501,6 +513,7 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 			w.deliver(rpcReply{err: ErrClosed})
 		}
 		ch.shutdown(ErrClosed)
+		ch.conn.removeChannel(ch)
 		return nil
 	case channelFlow:
 		active := d.u8()&1 != 0
@@ -540,6 +553,9 @@ func (ch *Channel) handleMethod(cm uint32, d *decoder) error {
 	}
 	w := ch.popWaiter()
 	if w == nil {
+		if ch.IsClosed() {
+			return nil // a late reply to a request that failed when the channel closed
+		}
 		return ch.frameError("unexpected " + methodName(cm))
 	}
 	if w.expect != cm && !(w.expect == basicGetOk && cm == basicGetEmpty) {
@@ -582,13 +598,20 @@ func (ch *Channel) handleHeader(payload []byte) error {
 	d.u16() // class id
 	d.u16() // weight
 	p.size = d.u64()
+	var headersErr error
 	if p.kind == pendReturn {
-		d.properties(&p.ret.Properties, &ch.propCache)
+		headersErr = d.properties(&p.ret.Properties, &ch.propCache)
 	} else {
-		d.properties(&p.delivery.Properties, &ch.propCache)
+		headersErr = d.properties(&p.delivery.Properties, &ch.propCache)
 	}
 	if d.err != nil {
 		return &Error{Code: FrameError, Reason: "malformed content header", Connection: true}
+	}
+	if headersErr != nil {
+		// Don't fail the connection (and every redelivery) because of
+		// headers this client can't decode, deliver the message without them
+		ch.conn.logger.Warn("amqp: dropped message headers that couldn't be decoded",
+			"channel", ch.id, "error", headersErr)
 	}
 	if p.size > uint64(math.MaxInt) {
 		return &Error{Code: FrameError, Reason: "body too large", Connection: true}
@@ -597,7 +620,9 @@ func (ch *Channel) handleHeader(payload []byte) error {
 	if p.size == 0 {
 		return ch.contentComplete()
 	}
-	p.body = make([]byte, 0, p.size)
+	// The body grows as frames arrive, a large size from the broker isn't
+	// trusted until the data is there
+	p.body = make([]byte, 0, min(p.size, maxBodyPrealloc))
 	return nil
 }
 
@@ -622,7 +647,7 @@ func (ch *Channel) contentComplete() error {
 	switch p.kind {
 	case pendDeliver:
 		p.delivery.Body = p.body
-		if ch.closing.Load() {
+		if ch.closing.Load() && (p.consumer == nil || !p.consumer.noAck) {
 			return nil // can't be acknowledged, the broker requeues it
 		}
 		if c := p.consumer; c != nil && c.abandoned {
@@ -638,8 +663,14 @@ func (ch *Channel) contentComplete() error {
 	case pendGet:
 		p.delivery.Body = p.body
 		w := ch.popWaiter()
+		if w == nil && ch.IsClosed() {
+			return nil // the broker requeues it when the channel closes
+		}
 		if w == nil || w.expect != basicGetOk {
 			return ch.frameError("unexpected basic.get-ok")
+		}
+		if w.noAck {
+			p.delivery.acked.Store(true)
 		}
 		if !w.deliver(rpcReply{cm: basicGetOk, delivery: p.delivery}) && !w.noAck {
 			// The caller gave up waiting, put the message back
@@ -838,19 +869,21 @@ func (ch *Channel) publish(ctx context.Context, exchange, routingKey string, msg
 	default:
 	}
 
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
-	if c.werr != nil {
-		return nil, c.werr
+	body := msg.Body
+	maxBody := int(c.frameMax) - frameOverhead
+	need := 512 + len(body) + (len(body)/maxBody+1)*frameOverhead
+	b, err := c.beginWrite(ctx, need, false)
+	if err != nil {
+		return nil, err
 	}
 	if ch.wclosed {
+		c.cancelWrite()
 		if err := ch.Err(); err != nil {
 			return nil, err
 		}
 		return nil, ErrClosed
 	}
-	body := msg.Body
-	b, start := beginMethod(c.bw.AvailableBuffer(), ch.id, basicPublish)
+	b, start := beginMethod(b, ch.id, basicPublish)
 	b = append(b, 0, 0) // reserved
 	b = appendShortStr(b, exchange)
 	b = appendShortStr(b, routingKey)
@@ -864,14 +897,22 @@ func (ch *Channel) publish(ctx context.Context, exchange, routingKey string, msg
 	b = be.AppendUint16(b, classBasic)
 	b = append(b, 0, 0) // weight
 	b = be.AppendUint64(b, uint64(len(body)))
-	b, err := appendProperties(b, &msg.Properties)
-	if err != nil {
+	if b, err = appendProperties(b, &msg.Properties); err != nil {
+		c.cancelWrite()
 		return nil, err
 	}
-	if size := len(b) - start; size > int(c.frameMax)-frameOverhead {
+	if size := len(b) - start; size > maxBody {
+		c.cancelWrite()
 		return nil, fmt.Errorf("amqp: content header of %d bytes exceeds frame max %d", size, c.frameMax)
 	}
 	b = endFrame(b, start)
+	for len(body) > 0 {
+		n := min(len(body), maxBody)
+		b, start = beginFrame(b, frameBody, ch.id)
+		b = append(b, body[:n]...)
+		b = endFrame(b, start)
+		body = body[n:]
+	}
 
 	var conf *Confirmation
 	if ch.confirmMode.Load() {
@@ -883,33 +924,7 @@ func (ch *Channel) publish(ctx context.Context, exchange, routingKey string, msg
 		ch.unconfirmed = append(ch.unconfirmed, unconfirmed{tag, conf})
 		ch.confMu.Unlock()
 	}
-
-	maxBody := int(c.frameMax) - frameOverhead
-	if len(body) <= maxBody && len(b)+len(body)+frameOverhead <= cap(b) {
-		// Everything fits in the write buffer, write it in one go
-		if len(body) > 0 {
-			b, start = beginFrame(b, frameBody, ch.id)
-			b = append(b, body...)
-			b = endFrame(b, start)
-		}
-		_, err = c.bw.Write(b)
-	} else {
-		_, err = c.bw.Write(b)
-		for len(body) > 0 && err == nil {
-			n := min(len(body), maxBody)
-			hdr := [7]byte{frameBody, byte(ch.id >> 8), byte(ch.id)}
-			be.PutUint32(hdr[3:], uint32(n))
-			c.bw.Write(hdr[:])
-			c.bw.Write(body[:n])
-			err = c.bw.WriteByte(frameEnd)
-			body = body[n:]
-		}
-	}
-	if err != nil {
-		c.writeFailed(err)
-		return nil, c.werr
-	}
-	c.doneWriting(false)
+	c.endWrite(b)
 	return conf, nil
 }
 
@@ -945,7 +960,6 @@ func (ch *Channel) WaitForConfirms(ctx context.Context) error {
 		select {
 		case <-w.done:
 		case <-ch.done:
-			return ch.err
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -1034,6 +1048,9 @@ func (ch *Channel) BasicGet(ctx context.Context, queue string, noAck bool) (msg 
 // BasicAck acknowledges a delivery, or with multiple all deliveries up to
 // and including deliveryTag.
 func (ch *Channel) BasicAck(deliveryTag uint64, multiple bool) error {
+	if multiple {
+		ch.settled(deliveryTag)
+	}
 	return ch.send(basicAck, func(b []byte) ([]byte, error) {
 		return appendBits(be.AppendUint64(b, deliveryTag), multiple), nil
 	})
@@ -1043,9 +1060,22 @@ func (ch *Channel) BasicAck(deliveryTag uint64, multiple bool) error {
 // including deliveryTag. With requeue the messages are put back in the
 // queue, otherwise they're dropped or dead-lettered.
 func (ch *Channel) BasicNack(deliveryTag uint64, multiple, requeue bool) error {
+	if multiple {
+		ch.settled(deliveryTag)
+	}
 	return ch.send(basicNack, func(b []byte) ([]byte, error) {
 		return appendBits(be.AppendUint64(b, deliveryTag), multiple, requeue), nil
 	})
+}
+
+// settled records that all deliveries up to tag are acknowledged.
+func (ch *Channel) settled(tag uint64) {
+	for {
+		old := ch.settledUpTo.Load()
+		if tag <= old || ch.settledUpTo.CompareAndSwap(old, tag) {
+			return
+		}
+	}
 }
 
 // BasicReject rejects a single delivery, see [Channel.BasicNack].

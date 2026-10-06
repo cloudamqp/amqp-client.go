@@ -8,8 +8,8 @@ import (
 )
 
 // ErrAlreadyAcknowledged is returned when acknowledging or rejecting a
-// delivery a second time, which would otherwise make the broker close the
-// channel.
+// delivery a second time, or one delivered with no-ack, which would
+// otherwise make the broker close the channel.
 var ErrAlreadyAcknowledged = errors.New("amqp: delivery already acknowledged or rejected")
 
 // Delivery is a message delivered to a consumer or fetched with
@@ -31,9 +31,23 @@ type Delivery struct {
 // Channel returns the channel the message was delivered on.
 func (d *Delivery) Channel() *Channel { return d.channel }
 
-// Ack acknowledges the delivery, the broker then removes the message.
+// settle marks the delivery as acknowledged, it returns false if it
+// already was: by Ack, Nack or Reject, by the channel's BasicAck or BasicNack
+// with multiple, or because it was delivered with no-ack. Acknowledging it
+// again would make the broker close the channel.
+func (d *Delivery) settle() bool {
+	if d.channel != nil && d.DeliveryTag <= d.channel.settledUpTo.Load() {
+		d.acked.Store(true)
+		return false
+	}
+	return d.acked.CompareAndSwap(false, true)
+}
+
+// Ack acknowledges the delivery, the broker then removes the message. It
+// returns ErrAlreadyAcknowledged if the delivery is already acknowledged
+// or rejected, or was delivered with no-ack.
 func (d *Delivery) Ack() error {
-	if !d.acked.CompareAndSwap(false, true) {
+	if !d.settle() {
 		return ErrAlreadyAcknowledged
 	}
 	return d.channel.BasicAck(d.DeliveryTag, false)
@@ -42,7 +56,7 @@ func (d *Delivery) Ack() error {
 // Nack rejects the delivery. With requeue the message is put back in the
 // queue, otherwise it's dropped or dead-lettered.
 func (d *Delivery) Nack(requeue bool) error {
-	if !d.acked.CompareAndSwap(false, true) {
+	if !d.settle() {
 		return ErrAlreadyAcknowledged
 	}
 	return d.channel.BasicNack(d.DeliveryTag, false, requeue)
@@ -50,14 +64,18 @@ func (d *Delivery) Nack(requeue bool) error {
 
 // Reject is like Nack, using basic.reject.
 func (d *Delivery) Reject(requeue bool) error {
-	if !d.acked.CompareAndSwap(false, true) {
+	if !d.settle() {
 		return ErrAlreadyAcknowledged
 	}
 	return d.channel.BasicReject(d.DeliveryTag, requeue)
 }
 
-// Acknowledged reports whether Ack, Nack or Reject has been called.
-func (d *Delivery) Acknowledged() bool { return d.acked.Load() }
+// Acknowledged reports whether the delivery is acknowledged or rejected,
+// with its own methods or the channel's with multiple, or was delivered
+// with no-ack.
+func (d *Delivery) Acknowledged() bool {
+	return d.acked.Load() || d.channel != nil && d.DeliveryTag <= d.channel.settledUpTo.Load()
+}
 
 // Decode decodes the body into v according to the message's content
 // encoding and content type, using the connection's [Config.Codecs] or

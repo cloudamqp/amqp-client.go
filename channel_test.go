@@ -791,3 +791,94 @@ func TestChannelCloseKeepsConfirms(t *testing.T) {
 		t.Fatalf("%d acked but %d in the queue", acked, info.MessageCount)
 	}
 }
+
+// Issue #8
+func TestNoAckBufferedDeliveriesSurviveClose(t *testing.T) {
+	conn := dialTest(t, nil)
+	ch := openChannel(t, conn)
+	ctx := testContext(t)
+	q := tempQueue(t, ch)
+	cons, err := ch.BasicConsume(ctx, q, ConsumeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := openChannel(t, conn)
+	for i := range 10 {
+		pub.BasicPublish(ctx, "", q, Publishing{Body: fmt.Append(nil, i)})
+	}
+	for buffered := 0; buffered < 10; time.Sleep(time.Millisecond) {
+		cons.mu.Lock()
+		buffered = len(cons.buf) - cons.head
+		cons.mu.Unlock()
+	}
+	if err := ch.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 10 {
+		d, err := cons.Next(ctx)
+		if err != nil || string(d.Body) != fmt.Sprint(i) {
+			t.Fatalf("expected message %d, got %v %v", i, d, err)
+		}
+	}
+	if _, err := cons.Next(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}
+
+// Issue #13
+func TestAckDoesntCloseTheChannel(t *testing.T) {
+	conn := dialTest(t, nil)
+	ch := openChannel(t, conn)
+	ctx := testContext(t)
+	info, err := ch.QueueDeclare(ctx, "", QueueDeclareOptions{Exclusive: true}) // not auto-delete
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := info.Name
+	for range 3 {
+		ch.BasicPublish(ctx, "", q, Publishing{Body: []byte("x")})
+	}
+	// A no-ack delivery can't be acked
+	d, ok, err := ch.BasicGet(ctx, q, true)
+	if err != nil || !ok {
+		t.Fatal(ok, err)
+	}
+	if !d.Acknowledged() || !errors.Is(d.Ack(), ErrAlreadyAcknowledged) {
+		t.Fatal("expected a no-ack delivery to be acknowledged")
+	}
+	// Deliveries covered by a multiple ack can't be acked again
+	cons, err := ch.BasicConsume(ctx, q, ConsumeOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, _ := cons.Next(ctx)
+	d2, _ := cons.Next(ctx)
+	if err := ch.BasicAck(d2.DeliveryTag, true); err != nil {
+		t.Fatal(err)
+	}
+	if !d1.Acknowledged() || !errors.Is(d1.Ack(), ErrAlreadyAcknowledged) || !errors.Is(d2.Nack(true), ErrAlreadyAcknowledged) {
+		t.Fatal("expected the deliveries to be acknowledged")
+	}
+	if _, err := ch.QueueDeclare(ctx, q, QueueDeclareOptions{Passive: true}); err != nil {
+		t.Fatalf("expected the channel to stay open, got %v", err)
+	}
+	// No-ack consumers
+	if err := cons.Cancel(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cons2, err := ch.BasicConsume(ctx, q, ConsumeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch.BasicPublish(ctx, "", q, Publishing{Body: []byte("x")})
+	d, err = cons2.Next(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(d.Ack(), ErrAlreadyAcknowledged) {
+		t.Fatal("expected a no-ack delivery to be acknowledged")
+	}
+	if _, err := ch.QueueDeclare(ctx, q, QueueDeclareOptions{Passive: true}); err != nil {
+		t.Fatalf("expected the channel to stay open, got %v", err)
+	}
+}

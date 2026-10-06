@@ -117,6 +117,11 @@ func (c *Client) RPCClient(ctx context.Context) (*RPCClient, error) {
 		return nil, err
 	}
 	c.topoMu.Lock()
+	if c.ctx.Err() != nil {
+		c.topoMu.Unlock()
+		r.Close()
+		return nil, c.Err()
+	}
 	c.rpcClients[r] = struct{}{}
 	c.topoMu.Unlock()
 	return r, nil

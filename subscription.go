@@ -49,6 +49,9 @@ type Subscription struct {
 	cons    *Consumer
 	changed chan struct{} // closed when cons is replaced
 	stopped bool
+	// ephemeral subscriptions are started from OnConnect, they don't
+	// survive their connection, OnConnect subscribes again
+	ephemeral bool
 
 	handlerCtx context.Context // the client's context, marked as a handler's
 
@@ -74,6 +77,7 @@ func (c *Client) subscribe(ctx context.Context, q *Queue, handler Handler, opts 
 	}
 	s := &Subscription{c: c, q: q, handler: handler, opts: o, changed: make(chan struct{}), done: make(chan struct{})}
 	s.ctx, s.cancel = context.WithCancel(c.ctx)
+	s.ephemeral = inOnConnect(ctx)
 	s.handlerCtx = context.WithValue(c.ctx, handlerKey{}, s)
 
 	var cons *Consumer
@@ -93,6 +97,13 @@ func (c *Client) subscribe(ctx context.Context, q *Queue, handler Handler, opts 
 	}
 	s.cons = cons
 	c.topoMu.Lock()
+	if c.ctx.Err() != nil {
+		// Close ran while subscribing, it has already stopped the others
+		c.topoMu.Unlock()
+		s.cancel()
+		cons.ch.Close()
+		return nil, c.Err()
+	}
 	c.subs[s] = struct{}{}
 	c.topoMu.Unlock()
 	s.workers.Add(o.Workers)
@@ -212,8 +223,13 @@ func (s *Subscription) monitor(cons *Consumer) {
 				// so that buffered deliveries can still be acknowledged
 				next, err = s.consumeOn(s.ctx, cons.ch)
 			} else {
-				var conn *Connection
-				if conn, err = s.c.connection(s.ctx); err != nil {
+				conn := cons.ch.conn
+				if s.ephemeral {
+					if conn.IsClosed() {
+						s.stop(conn.Err(), false)
+						return
+					}
+				} else if conn, err = s.c.connection(s.ctx); err != nil {
 					s.stop(err, false)
 					return
 				}

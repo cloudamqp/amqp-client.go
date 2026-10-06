@@ -32,6 +32,9 @@ type ClientOptions struct {
 	// first one, once the topology is recovered. The client's methods can
 	// be used in it, e.g. to declare topology that isn't recovered
 	// automatically. Its context is cancelled if the connection is lost.
+	// What's declared with that context (queues, exchanges, bindings) isn't
+	// recovered after a reconnect, as OnConnect declares it again, and
+	// subscriptions started with it stop when the connection is lost.
 	// An error from the first call makes NewClient fail, later errors are
 	// logged. Later calls run in their own goroutine, one at a time.
 	OnConnect func(ctx context.Context, c *Client) error
@@ -70,8 +73,9 @@ type Client struct {
 	changed chan struct{} // closed and replaced when conn or err changes
 	err     error         // set when the client is closed or gave up
 
-	ops *lazyChannel // declarations, bindings, gets
-	pub *lazyChannel // publishing, in confirm mode
+	ops  *lazyChannel // declarations and bindings
+	pub  *lazyChannel // publishing, in confirm mode
+	gets *lazyChannel // basic.get, apart from ops so that a failed declaration doesn't close it before the messages are acked
 
 	topoMu     sync.Mutex
 	exchanges  map[string]*Exchange
@@ -136,6 +140,7 @@ func NewClient(ctx context.Context, url string, opts *ClientOptions) (*Client, e
 	}
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.ops = &lazyChannel{c: c}
+	c.gets = &lazyChannel{c: c}
 	c.pub = &lazyChannel{c: c, confirm: true}
 
 	conn, err := DialURI(ctx, u, &o.Config)
@@ -154,12 +159,21 @@ func NewClient(ctx context.Context, url string, opts *ClientOptions) (*Client, e
 	return c, nil
 }
 
+type onConnectKey struct{}
+
+// inOnConnect reports whether ctx is the context passed to OnConnect.
+// Topology declared in OnConnect isn't recovered, OnConnect declares it
+// again on the next connection.
+func inOnConnect(ctx context.Context) bool {
+	return ctx.Value(onConnectKey{}) != nil
+}
+
 // runOnConnect calls OnConnect with a context that's cancelled if conn is
 // lost, so that it can't wait forever for a connection.
 func (c *Client) runOnConnect(ctx context.Context, conn *Connection) error {
 	c.onConnectMu.Lock()
 	defer c.onConnectMu.Unlock()
-	ctx, cancel := context.WithCancelCause(ctx)
+	ctx, cancel := context.WithCancelCause(context.WithValue(ctx, onConnectKey{}, c))
 	defer cancel(nil)
 	stop := context.AfterFunc(c.ctx, func() { cancel(ErrClosed) })
 	defer stop()
@@ -543,8 +557,12 @@ func isConnectionLost(err error) bool {
 // withChannel runs fn on the operations channel. If the connection is lost
 // it's retried on the next connection, until ctx is done.
 func (c *Client) withChannel(ctx context.Context, fn func(ch *Channel) error) error {
+	return c.withLazyChannel(ctx, c.ops, fn)
+}
+
+func (c *Client) withLazyChannel(ctx context.Context, l *lazyChannel, fn func(ch *Channel) error) error {
 	for {
-		ch, err := c.ops.get(ctx)
+		ch, err := l.get(ctx)
 		if err != nil {
 			return err
 		}
@@ -685,7 +703,7 @@ func (c *Client) Queue(ctx context.Context, name string, opts *QueueOptions) (*Q
 			}
 		}
 	}
-	if !o.Passive {
+	if !o.Passive && !inOnConnect(ctx) {
 		c.queues = append(c.queues, q)
 	}
 	return q, nil
@@ -712,7 +730,7 @@ func (c *Client) Exchange(ctx context.Context, name, kind string, opts *Exchange
 		return nil, err
 	}
 	c.knownExchanges.Store(name, struct{}{})
-	if !o.Passive {
+	if !o.Passive && !inOnConnect(ctx) {
 		c.topoMu.Lock()
 		c.exchanges[name] = x
 		c.topoMu.Unlock()

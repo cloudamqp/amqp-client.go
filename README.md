@@ -76,6 +76,8 @@ c, err := amqp.NewClient(ctx, url, &amqp.ClientOptions{
 })
 ```
 
+Topology that `OnConnect` declares with its context isn't recovered, because `OnConnect` declares it again on every connection. Subscriptions it starts end with their connection, and `OnConnect` starts them again.
+
 Each reconnect attempt times out after `Config.ConnectTimeout` (30s by default). A connection that the broker closes soon after it's established, for example because of a connection limit, counts as a failed attempt, so the backoff and `MaxRetries` apply.
 
 When the client reconnects, it declares exchanges, queues and bindings again. A server-named queue gets a new name, and `Queue.Name()` returns the new one. Subscriptions consume again, also after their channel is closed while the connection stays up, for example after a consumer timeout. If the broker has deleted the queue in the meantime (an auto-delete queue is deleted when its last consumer goes away), it's declared again with its bindings. Messages that were in process when the connection was lost are redelivered, so make handlers idempotent.
@@ -104,7 +106,7 @@ _, err = q.Subscribe(ctx, func(ctx context.Context, d *amqp.Delivery) error {
 }, nil)
 ```
 
-Register your own codecs with `Codecs.RegisterSerializer` (by content type) and `Codecs.RegisterEncoder` (by content encoding).
+Register your own codecs with `Codecs.RegisterSerializer` (by content type) and `Codecs.RegisterEncoder` (by content encoding). The built-in gzip and deflate encoders refuse to decode more than 128 MiB, to protect against compression bombs; use `amqp.NewGzip(limit)` or `amqp.NewDeflate(limit)` for another limit.
 
 ### RPC
 

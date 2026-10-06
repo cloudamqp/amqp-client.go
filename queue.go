@@ -58,7 +58,7 @@ func (q *Queue) Bind(ctx context.Context, exchange, bindingKey string, args Tabl
 	err := q.c.withChannel(ctx, func(ch *Channel) error {
 		return ch.QueueBind(ctx, q.Name(), exchange, bindingKey, args)
 	})
-	if err == nil {
+	if err == nil && !inOnConnect(ctx) {
 		q.c.addQueueBinding(queueBinding{q, exchange, bindingKey, args})
 	}
 	return err
@@ -76,9 +76,11 @@ func (q *Queue) Unbind(ctx context.Context, exchange, bindingKey string, args Ta
 }
 
 // Get fetches a message from the queue, ok is false if it's empty. Unless
-// noAck the message has to be acknowledged.
+// noAck the message has to be acknowledged. Gets share a channel, which the
+// broker closes if a get fails (e.g. because the queue was deleted); the
+// messages fetched on it but not yet acknowledged are then requeued.
 func (q *Queue) Get(ctx context.Context, noAck bool) (msg *Delivery, ok bool, err error) {
-	err = q.c.withChannel(ctx, func(ch *Channel) error {
+	err = q.c.withLazyChannel(ctx, q.c.gets, func(ch *Channel) error {
 		msg, ok, err = ch.BasicGet(ctx, q.Name(), noAck)
 		return err
 	})
@@ -161,7 +163,7 @@ func (x *Exchange) Bind(ctx context.Context, source, routingKey string, args Tab
 	err := x.c.withChannel(ctx, func(ch *Channel) error {
 		return ch.ExchangeBind(ctx, x.name, source, routingKey, args)
 	})
-	if err == nil {
+	if err == nil && !inOnConnect(ctx) {
 		x.c.addExchangeBinding(exchangeBinding{x.name, source, routingKey, args})
 	}
 	return err

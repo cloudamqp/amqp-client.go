@@ -147,12 +147,27 @@ func appendFieldValue(b []byte, v any) ([]byte, error) {
 }
 
 func (d *decoder) table() Table {
+	t, err := d.tableLenient()
+	if err != nil && d.err == nil {
+		d.err = err
+	}
+	return t
+}
+
+// tableLenient decodes a field table. If its content can't be decoded,
+// e.g. because of an unknown field type, the error is returned but the
+// table is skipped, so that decoding can continue after it.
+func (d *decoder) tableLenient() (Table, error) {
 	n := d.u32()
 	if uint64(n) > uint64(len(d.b)) {
 		d.fail()
-		return nil
+		return nil, d.err
 	}
-	td := decoder{b: d.b[:n]}
+	if d.depth >= maxNesting {
+		d.b = d.b[n:]
+		return nil, errTooDeep
+	}
+	td := decoder{b: d.b[:n], depth: d.depth + 1}
 	d.b = d.b[n:]
 	t := make(Table)
 	for len(td.b) > 0 && td.err == nil {
@@ -160,10 +175,9 @@ func (d *decoder) table() Table {
 		t[k] = td.fieldValue()
 	}
 	if td.err != nil {
-		d.err = td.err
-		return nil
+		return nil, td.err
 	}
-	return t
+	return t, nil
 }
 
 func (d *decoder) array() []any {
@@ -172,7 +186,11 @@ func (d *decoder) array() []any {
 		d.fail()
 		return nil
 	}
-	ad := decoder{b: d.b[:n]}
+	if d.depth >= maxNesting {
+		d.err = errTooDeep
+		return nil
+	}
+	ad := decoder{b: d.b[:n], depth: d.depth + 1}
 	d.b = d.b[n:]
 	a := []any{}
 	for len(ad.b) > 0 && ad.err == nil {
@@ -197,6 +215,8 @@ func (d *decoder) fieldValue() any {
 		return int16(d.u16())
 	case 'u':
 		return d.u16()
+	case 'U': // signed short int in AMQP 0-9
+		return int16(d.u16())
 	case 'I':
 		return int32(d.u32())
 	case 'i':

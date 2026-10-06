@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -73,7 +74,11 @@ func (f *fakeBroker) expect(cm uint32) frame {
 	for {
 		fr, err := f.read()
 		if err != nil {
-			f.t.Errorf("fake broker: expected %s: %v", methodName(cm), err)
+			select {
+			case <-f.quit: // the test is over
+			default:
+				f.t.Errorf("fake broker: expected %s: %v", methodName(cm), err)
+			}
 			return frame{}
 		}
 		if fr.typ == frameHeartbeat {
@@ -229,29 +234,53 @@ func TestFakeServerClosesConnection(t *testing.T) {
 	}
 }
 
+// expectClose reads frames until connection.close and sends its code.
+func (f *fakeBroker) expectClose(code chan<- uint16) {
+	for {
+		fr, err := f.read()
+		if err != nil {
+			code <- 0
+			return
+		}
+		if fr.typ == frameMethod && fr.method() == connectionClose {
+			code <- be.Uint16(fr.payload[4:])
+			io.Copy(io.Discard, f.conn)
+			return
+		}
+	}
+}
+
 func TestFakeFrameTooLarge(t *testing.T) {
+	code := make(chan uint16, 1)
 	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
 		f.send(frameBody, 1, make([]byte, 5000))
-		io.Copy(io.Discard, f.conn)
+		f.expectClose(code)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := waitDone(t, conn); !IsCode(err, FrameError) {
 		t.Fatalf("expected frame error, got %v", err)
+	}
+	if c := <-code; c != FrameError {
+		t.Fatalf("expected the client to send connection.close with 501, got %d", c)
 	}
 }
 
 func TestFakeMissingFrameEnd(t *testing.T) {
+	code := make(chan uint16, 1)
 	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
 		f.conn.Write([]byte{frameHeartbeat, 0, 0, 0, 0, 0, 0, 0})
-		io.Copy(io.Discard, f.conn)
+		f.expectClose(code)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := waitDone(t, conn); !IsCode(err, FrameError) {
 		t.Fatalf("expected frame error, got %v", err)
+	}
+	if c := <-code; c != FrameError {
+		t.Fatalf("expected the client to send connection.close with 501, got %d", c)
 	}
 }
 
@@ -564,5 +593,347 @@ func TestFakeRecoverBindingAfterNotFound(t *testing.T) {
 	}
 	if fmt.Sprint(steps) != "[exchange.declare queue.declare queue.bind]" {
 		t.Fatalf("unexpected recovery steps %v", steps)
+	}
+}
+
+// deliver sends a basic.deliver with its content.
+func (f *fakeBroker) deliver(ch uint16, tag string, deliveryTag uint64, props []byte, body string) {
+	args := appendShortStr(nil, tag)
+	args = be.AppendUint64(args, deliveryTag)
+	args = append(args, 0)
+	args = appendShortStr(args, "")
+	args = appendShortStr(args, "q")
+	f.method(ch, basicDeliver, args)
+	hdr := be.AppendUint16(nil, classBasic)
+	hdr = append(hdr, 0, 0)
+	hdr = be.AppendUint64(hdr, uint64(len(body)))
+	if props == nil {
+		props = []byte{0, 0}
+	}
+	f.send(frameHeader, ch, append(hdr, props...))
+	if body != "" {
+		f.send(frameBody, ch, []byte(body))
+	}
+}
+
+// consume answers a basic.consume with the given tag.
+func (f *fakeBroker) consume(tag string) uint16 {
+	fr := f.expect(basicConsume)
+	f.method(fr.channel, basicConsumeOk, appendShortStr(nil, tag))
+	return fr.channel
+}
+
+// Issue #8
+func TestFakeNoAckDeliveryWhileClosing(t *testing.T) {
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.consume("t")
+		f.expect(channelClose)
+		f.deliver(ch, "t", 1, nil, "in flight")
+		f.method(ch, channelCloseOk, nil)
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ch, _ := conn.Channel(ctx)
+	cons, err := ch.BasicConsume(ctx, "q", ConsumeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ch.Close(); err != nil {
+		t.Fatal(err)
+	}
+	d, err := cons.Next(ctx)
+	if err != nil || string(d.Body) != "in flight" {
+		t.Fatalf("expected the delivery, got %v %v", d, err)
+	}
+	if _, err := cons.Next(ctx); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}
+
+// Issue #9
+func TestFakeChannelIDReservedAfterCloseTimeout(t *testing.T) {
+	old := closeTimeout
+	closeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { closeTimeout = old })
+	lateCloseOk := make(chan struct{})
+	conn, err := dialFake(t, nil, func(b []byte) []byte {
+		b = be.AppendUint16(b, 1) // a single channel
+		b = be.AppendUint32(b, 4096)
+		return be.AppendUint16(b, 0)
+	}, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.expect(channelClose) // not answered in time
+		<-lateCloseOk
+		f.method(ch, channelCloseOk, nil)
+		f.openChannel()
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ch, err := conn.Channel(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch.Close()
+	if _, err := conn.Channel(ctx); !errors.Is(err, ErrChannelMax) {
+		t.Fatalf("expected the id to be reserved, got %v", err)
+	}
+	close(lateCloseOk)
+	var ch2 *Channel
+	for range 50 {
+		if ch2, err = conn.Channel(ctx); !errors.Is(err, ErrChannelMax) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ch2.IsClosed() || conn.IsClosed() {
+		t.Fatal("expected the new channel to stay open")
+	}
+}
+
+// Issue #9
+func TestFakeAbandonedConsumeCancelledByServer(t *testing.T) {
+	consumeSent := make(chan struct{})
+	gaveUp := make(chan struct{})
+	cancelled := make(chan struct{})
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.expect(basicConsume)
+		close(consumeSent)
+		<-gaveUp
+		f.method(ch, basicConsumeOk, appendShortStr(nil, "t"))
+		f.expect(basicCancel)
+		f.method(ch, basicCancel, append(appendShortStr(nil, "t"), 1)) // the server cancels it too
+		f.method(ch, basicCancelOk, appendShortStr(nil, "t"))
+		close(cancelled)
+		f.expect(basicQos)
+		f.method(ch, basicQosOk, nil)
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, _ := conn.Channel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { <-consumeSent; cancel(); time.Sleep(20 * time.Millisecond); close(gaveUp) }()
+	if _, err := ch.BasicConsume(ctx, "q", ConsumeOptions{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	<-cancelled
+	time.Sleep(20 * time.Millisecond) // let the read loop process the cancel-ok
+	if err := ch.BasicQos(context.Background(), 1, false); err != nil {
+		t.Fatalf("expected the connection to stay open, got %v", err)
+	}
+}
+
+// Issue #10
+func TestFakeBlockedWriteRespectsContext(t *testing.T) {
+	stalled := make(chan struct{})
+	resume := make(chan struct{})
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		f.openChannel()
+		ch2 := f.openChannel()
+		f.consume("c2")
+		close(stalled) // stop reading, until resume
+		<-resume
+		f.method(1, channelFlow, []byte{0})
+		f.deliver(ch2, "c2", 1, nil, "still delivered")
+		<-f.quit
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	ch1, _ := conn.Channel(ctx)
+	ch2, _ := conn.Channel(ctx)
+	cons, err := ch2.BasicConsume(ctx, "q", ConsumeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-stalled
+	body := make([]byte, 1<<20)
+	start := time.Now()
+	var perr error
+	for time.Since(start) < 5*time.Second {
+		pctx, cancel := context.WithTimeout(ctx, 200*time.Millisecond)
+		perr = ch1.BasicPublish(pctx, "", "q", Publishing{Body: body})
+		cancel()
+		if perr != nil {
+			break
+		}
+	}
+	if !errors.Is(perr, context.DeadlineExceeded) || time.Since(start) > 3*time.Second {
+		t.Fatalf("expected the publish to time out, got %v after %v", perr, time.Since(start))
+	}
+	close(resume)
+	nctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if d, err := cons.Next(nctx); err != nil || string(d.Body) != "still delivered" {
+		t.Fatalf("expected the read loop to keep going, got %v %v", d, err)
+	}
+}
+
+// Issue #11
+func TestFakeUndecodableHeaders(t *testing.T) {
+	headers := func(field []byte) []byte {
+		tbl := appendShortStr(nil, "z")
+		tbl = append(tbl, field...)
+		props := be.AppendUint16(nil, flagContentType|flagHeaders)
+		props = appendShortStr(props, "text/plain")
+		props = be.AppendUint32(props, uint32(len(tbl)))
+		props = append(props, tbl...)
+		return append(props, 0) // not part of the headers
+	}
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.consume("t")
+		f.deliver(ch, "t", 1, headers([]byte{'U', 0xff, 0xfe}), "signed short")
+		f.deliver(ch, "t", 2, headers([]byte{'?', 1, 2}), "unknown type")
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ch, _ := conn.Channel(ctx)
+	cons, err := ch.BasicConsume(ctx, "q", ConsumeOptions{NoAck: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := cons.Next(ctx)
+	if err != nil || d.Headers["z"] != int16(-2) || d.ContentType != "text/plain" {
+		t.Fatalf("unexpected %+v %v", d, err)
+	}
+	d, err = cons.Next(ctx)
+	if err != nil || d.Headers != nil || d.ContentType != "text/plain" || string(d.Body) != "unknown type" {
+		t.Fatalf("expected the message without headers, got %+v %v", d, err)
+	}
+	if conn.IsClosed() {
+		t.Fatal(conn.Err())
+	}
+}
+
+// Issue #12
+func TestFakeLargeBodySize(t *testing.T) {
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.consume("t")
+		args := appendShortStr(nil, "t")
+		args = be.AppendUint64(args, 1)
+		args = append(args, 0, 0, 0)
+		f.method(ch, basicDeliver, args)
+		hdr := be.AppendUint16(nil, classBasic)
+		hdr = append(hdr, 0, 0)
+		hdr = be.AppendUint64(hdr, 1<<62)
+		f.send(frameHeader, ch, be.AppendUint16(hdr, 0))
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, _ := conn.Channel(context.Background())
+	if _, err := ch.BasicConsume(context.Background(), "q", ConsumeOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the read loop must not panic
+	if conn.IsClosed() {
+		t.Fatal(conn.Err())
+	}
+}
+
+func dialRaw(t *testing.T, cfg *Config, server func(conn net.Conn)) error {
+	t.Helper()
+	client, srv := net.Pipe()
+	defer srv.Close()
+	go func() {
+		io.ReadFull(srv, make([]byte, 8))
+		server(srv)
+	}()
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	cfg.Dial = func(ctx context.Context, network, addr string) (net.Conn, error) { return client, nil }
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, err := Dial(ctx, "amqp://localhost", cfg)
+	return err
+}
+
+// Issue #12
+func TestFakeNotAnAMQPBroker(t *testing.T) {
+	err := dialRaw(t, nil, func(c net.Conn) { c.Write([]byte("AMQP\x00\x01\x00\x00")) })
+	if err == nil || !strings.Contains(err.Error(), "supports 1-0-0") {
+		t.Fatalf("expected a protocol version error, got %v", err)
+	}
+	err = dialRaw(t, nil, func(c net.Conn) { c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n")) })
+	if err == nil || !strings.Contains(err.Error(), "not an AMQP 0-9-1 broker") {
+		t.Fatalf("expected a not an AMQP broker error, got %v", err)
+	}
+}
+
+// Issue #12
+func TestFakeHandshakeLimits(t *testing.T) {
+	start := func(props Table) []byte {
+		args := []byte{0, 9}
+		args, _ = appendTable(args, props)
+		args = appendLongStr(args, "PLAIN")
+		args = appendLongStr(args, "en_US")
+		b, s := beginMethod(nil, 0, connectionStart)
+		return endFrame(append(b, args...), s)
+	}
+	big := start(Table{"x": strings.Repeat("x", 10000)})
+	err := dialRaw(t, &Config{FrameMax: 8192}, func(c net.Conn) { c.Write(big) })
+	if !IsCode(err, FrameError) {
+		t.Fatalf("expected a frame error for a too large connection.start, got %v", err)
+	}
+	nested := Table{}
+	for range 200 {
+		nested = Table{"n": nested}
+	}
+	deep := start(nested)
+	err = dialRaw(t, nil, func(c net.Conn) { c.Write(deep) })
+	if err == nil {
+		t.Fatal("expected an error for deeply nested tables")
+	}
+}
+
+// Issue #14
+func TestFakeUpdateSecretPairsReplies(t *testing.T) {
+	sentA := make(chan struct{})
+	sentB := make(chan struct{})
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		f.expect(connectionUpdateSecret)
+		close(sentA)
+		f.expect(connectionUpdateSecret)
+		close(sentB)
+		f.method(0, connectionUpdateSecretOk, nil) // A's, late
+		time.Sleep(200 * time.Millisecond)
+		f.method(0, connectionUpdateSecretOk, nil) // B's
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	go func() { <-sentA; cancelA() }()
+	if err := conn.UpdateSecret(ctxA, "a", "A"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	start := time.Now()
+	if err := conn.UpdateSecret(context.Background(), "b", "B"); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Fatal("B returned on A's reply")
 	}
 }

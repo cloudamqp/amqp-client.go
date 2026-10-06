@@ -73,9 +73,16 @@ var errMalformed = errors.New("amqp: malformed frame")
 // decoder reads protocol fields from a frame payload. The first error is
 // sticky, so callers can read all fields and check err once.
 type decoder struct {
-	b   []byte
-	err error
+	b     []byte
+	err   error
+	depth int // nesting of tables and arrays
 }
+
+// maxNesting limits how deeply tables and arrays can be nested, the
+// decoder is recursive.
+const maxNesting = 64
+
+var errTooDeep = errors.New("amqp: field tables nested too deeply")
 
 func (d *decoder) fail() {
 	if d.err == nil {

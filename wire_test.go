@@ -292,3 +292,52 @@ func TestConfirmTracking(t *testing.T) {
 	// Unknown tags are ignored
 	ch.confirmed(99, false, true)
 }
+
+// Issue #11
+func TestPropertiesContinuationFlags(t *testing.T) {
+	b := be.AppendUint16(nil, flagContentType|flagContinuation)
+	b = be.AppendUint16(b, 0x8000) // a property this client doesn't know
+	b = appendShortStr(b, "text/plain")
+	b = append(b, "unknown property"...)
+	var p Properties
+	d := decoder{b: b}
+	if err := d.properties(&p, &propCache{}); err != nil || d.err != nil || p.ContentType != "text/plain" {
+		t.Fatalf("unexpected %+v %v %v", p, err, d.err)
+	}
+}
+
+// Issue #12
+func TestDecodedSizeLimit(t *testing.T) {
+	for name, enc := range map[string]Encoder{"gzip": NewGzip(1000), "deflate": NewDeflate(1000)} {
+		data, err := enc.Encode(make([]byte, 100_000))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := enc.Decode(data); !errors.Is(err, ErrDecodedTooLarge) {
+			t.Fatalf("%s: expected ErrDecodedTooLarge, got %v", name, err)
+		}
+		small, _ := enc.Encode(make([]byte, 1000))
+		if out, err := enc.Decode(small); err != nil || len(out) != 1000 {
+			t.Fatalf("%s: %d %v", name, len(out), err)
+		}
+	}
+}
+
+// Issue #12
+func TestNestingLimit(t *testing.T) {
+	var b []byte
+	for range 100 {
+		b = append([]byte{'A', 0, 0, 0, 0}, b...)
+	}
+	// fix up the lengths from the inside out
+	for i := len(b)/5 - 1; i >= 0; i-- {
+		be.PutUint32(b[i*5+1:], uint32(len(b)-(i*5+5)))
+	}
+	tbl := appendShortStr(nil, "k")
+	tbl = append(tbl, b...)
+	d := decoder{b: append(be.AppendUint32(nil, uint32(len(tbl))), tbl...)}
+	d.table()
+	if !errors.Is(d.err, errTooDeep) {
+		t.Fatalf("expected errTooDeep, got %v", d.err)
+	}
+}
