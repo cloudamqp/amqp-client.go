@@ -190,7 +190,7 @@ func TestCodecs(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if enc != "" && enc != "identity" && bytes.Contains(b, []byte("42")) {
+		if enc != "" && enc != "identity" && bytes.Contains(b, []byte(`{"A":42}`)) {
 			t.Fatalf("%s: expected encoded data", enc)
 		}
 		var out v

@@ -243,7 +243,7 @@ func TestConsumerCancelledByServer(t *testing.T) {
 	ch := openChannel(t, conn)
 	ctx := testContext(t)
 	name := randomName("test-server-cancel")
-	if _, err := ch.QueueDeclare(ctx, name, QueueDeclareOptions{}); err != nil {
+	if _, err := ch.QueueDeclare(ctx, name, QueueDeclareOptions{Durable: true}); err != nil {
 		t.Fatal(err)
 	}
 	cons, err := ch.BasicConsume(ctx, name, ConsumeOptions{})
@@ -537,7 +537,7 @@ func TestQueueDelete(t *testing.T) {
 	ch := openChannel(t, conn)
 	ctx := testContext(t)
 	name := randomName("test-delete")
-	if _, err := ch.QueueDeclare(ctx, name, QueueDeclareOptions{}); err != nil {
+	if _, err := ch.QueueDeclare(ctx, name, QueueDeclareOptions{Durable: true}); err != nil {
 		t.Fatal(err)
 	}
 	ch.ConfirmSelect(ctx)

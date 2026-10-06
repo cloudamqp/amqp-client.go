@@ -507,7 +507,7 @@ func TestClientClose(t *testing.T) {
 func TestSubscriptionStopsWhenQueueDeleted(t *testing.T) {
 	c := newTestClient(t, testURL(), nil)
 	ctx := testContext(t)
-	q, err := c.Queue(ctx, randomName("test-deleted"), &QueueOptions{AutoDelete: false})
+	q, err := c.Queue(ctx, randomName("test-deleted"), nil) // durable
 	if err != nil {
 		t.Fatal(err)
 	}
