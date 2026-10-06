@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-06
+
 ### Added
 
 - `NewGzip` and `NewDeflate` return encoders with a decoded size limit. `ErrDecodedTooLarge` is returned when a body decodes to more than that.
@@ -57,7 +59,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Low-level API: `Dial`, `Connection` and `Channel` with all AMQP 0-9-1 client methods, publisher confirms, consumers with `Next` and `Deliveries`, basic.get, transactions, returns, connection.blocked, update-secret and heartbeats.
 - High-level API: `Client` with automatic reconnection, recovery of exchanges, queues, bindings and subscriptions, confirmed publishing, subscriptions with worker pools and automatic acknowledgements, codecs and RPC over direct reply-to.
 
-[Unreleased]: https://github.com/cloudamqp/amqp-client.go/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/cloudamqp/amqp-client.go/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/cloudamqp/amqp-client.go/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/cloudamqp/amqp-client.go/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/cloudamqp/amqp-client.go/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/cloudamqp/amqp-client.go/releases/tag/v1.0.0
