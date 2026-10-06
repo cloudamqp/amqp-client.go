@@ -270,8 +270,19 @@ func (c *Client) recoverTopology(conn *Connection) error {
 		return err
 	}
 	defer func() { ch.Close() }()
-	// run a declaration, reopening the channel if the broker closes it
-	run := func(what string, fn func(ch *Channel) error) error {
+	reopen := func() error {
+		next, err := conn.Channel(ctx)
+		if err == nil {
+			ch = next
+		}
+		return err
+	}
+	// run a declaration, reopening the channel if the broker closes it. If
+	// it fails with NotFound, redeclare (if given) declares what it depends
+	// on before retrying once: an auto-delete exchange or queue can be
+	// deleted by the broker cleaning up the old connection after we
+	// redeclared it.
+	run := func(what string, fn, redeclare func(ch *Channel) error) error {
 		err := fn(ch)
 		if err == nil {
 			return nil
@@ -280,38 +291,58 @@ func (c *Client) recoverTopology(conn *Connection) error {
 		if !errors.As(err, &e) || e.Connection {
 			return err
 		}
-		c.log.Error("amqp: failed to recover "+what, "error", err)
-		next, err := conn.Channel(ctx)
-		if err != nil {
-			return err
+		if e.Code == NotFound && redeclare != nil {
+			if err := reopen(); err != nil {
+				return err
+			}
+			if err = redeclare(ch); err == nil {
+				if err = fn(ch); err == nil {
+					return nil
+				}
+			}
+			if !errors.As(err, &e) || e.Connection {
+				return err
+			}
 		}
-		ch = next
-		return nil
+		c.log.Error("amqp: failed to recover "+what, "error", err)
+		return reopen()
 	}
 
 	c.topoMu.Lock()
-	exchanges := make([]*Exchange, 0, len(c.exchanges))
-	for _, x := range c.exchanges {
-		exchanges = append(exchanges, x)
+	exchanges := make(map[string]*Exchange, len(c.exchanges))
+	for name, x := range c.exchanges {
+		exchanges[name] = x
 	}
 	queues := append([]*Queue(nil), c.queues...)
 	qbindings := append([]queueBinding(nil), c.qbindings...)
 	xbindings := append([]exchangeBinding(nil), c.xbindings...)
 	c.topoMu.Unlock()
 
+	declareExchanges := func(ch *Channel, names ...string) error {
+		for _, name := range names {
+			if x := exchanges[name]; x != nil {
+				if err := x.declare(ctx, ch); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	for _, x := range exchanges {
-		if err := run("exchange "+x.name, func(ch *Channel) error { return x.declare(ctx, ch) }); err != nil {
+		if err := run("exchange "+x.name, func(ch *Channel) error { return x.declare(ctx, ch) }, nil); err != nil {
 			return err
 		}
 	}
 	for _, q := range queues {
-		if err := run("queue "+q.Name(), func(ch *Channel) error { return q.declare(ctx, ch) }); err != nil {
+		if err := run("queue "+q.Name(), func(ch *Channel) error { return q.declare(ctx, ch) }, nil); err != nil {
 			return err
 		}
 	}
 	for _, b := range xbindings {
 		err := run("exchange binding", func(ch *Channel) error {
 			return ch.ExchangeBind(ctx, b.destination, b.source, b.routingKey, b.args)
+		}, func(ch *Channel) error {
+			return declareExchanges(ch, b.destination, b.source)
 		})
 		if err != nil {
 			return err
@@ -320,6 +351,11 @@ func (c *Client) recoverTopology(conn *Connection) error {
 	for _, b := range qbindings {
 		err := run("queue binding", func(ch *Channel) error {
 			return ch.QueueBind(ctx, b.q.Name(), b.exchange, b.routingKey, b.args)
+		}, func(ch *Channel) error {
+			if err := declareExchanges(ch, b.exchange); err != nil {
+				return err
+			}
+			return b.q.declare(ctx, ch)
 		})
 		if err != nil {
 			return err

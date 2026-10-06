@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -509,5 +510,59 @@ func TestFakeDiscardedRequests(t *testing.T) {
 	}
 	if !errors.Is(err2, ErrClosed) || IsCode(err2, NotFound) || !isConnectionLost(err2) {
 		t.Fatalf("expected a retryable error for the second request, got %v", err2)
+	}
+}
+
+// An auto-delete exchange can be deleted by the broker's cleanup of the
+// old connection after the client redeclared it, recovery then redeclares
+// it before retrying the binding.
+func TestFakeRecoverBindingAfterNotFound(t *testing.T) {
+	var steps []string
+	conn, err := dialFake(t, nil, nil, func(f *fakeBroker) {
+		ch := f.openChannel()
+		f.expect(exchangeDeclare)
+		f.method(ch, exchangeDeclareOk, nil)
+		f.expect(queueDeclare)
+		f.method(ch, queueDeclareOk, append(appendShortStr(nil, "q"), 0, 0, 0, 0, 0, 0, 0, 0))
+		f.expect(queueBind)
+		args := be.AppendUint16(nil, NotFound)
+		args = appendShortStr(args, "NOT_FOUND - no exchange 'x'")
+		args = be.AppendUint16(args, classQueue)
+		args = be.AppendUint16(args, 20)
+		f.method(ch, channelClose, args)
+		f.expect(channelCloseOk)
+		ch = f.openChannel()
+		for _, cm := range []uint32{exchangeDeclare, queueDeclare, queueBind} {
+			f.expect(cm)
+			steps = append(steps, methodName(cm))
+			switch cm {
+			case queueDeclare:
+				f.method(ch, queueDeclareOk, append(appendShortStr(nil, "q"), 0, 0, 0, 0, 0, 0, 0, 0))
+			default:
+				f.method(ch, cm+1, nil) // the -ok reply
+			}
+		}
+		f.expect(channelClose)
+		f.method(ch, channelCloseOk, nil)
+		io.Copy(io.Discard, f.conn)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &Client{log: slog.New(slog.NewTextHandler(io.Discard, nil)), exchanges: map[string]*Exchange{}}
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+	defer c.cancel()
+	x := &Exchange{c: c, name: "x", kind: Topic, opts: ExchangeOptions{AutoDelete: true}}
+	q := &Queue{c: c, opts: QueueOptions{Exclusive: true}}
+	name := "q"
+	q.name.Store(&name)
+	c.exchanges["x"] = x
+	c.queues = []*Queue{q}
+	c.qbindings = []queueBinding{{q: q, exchange: "x", routingKey: "#"}}
+	if err := c.recoverTopology(conn); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(steps) != "[exchange.declare queue.declare queue.bind]" {
+		t.Fatalf("unexpected recovery steps %v", steps)
 	}
 }

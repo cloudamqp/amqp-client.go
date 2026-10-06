@@ -508,7 +508,7 @@ func (c *Connection) readLoop() {
 		}
 		ch := c.channel(channel)
 		if ch == nil {
-			c.logger.Warn("amqp: frame for unknown channel", "channel", channel, "type", typ)
+			c.logger.Debug("amqp: frame for unknown channel", "channel", channel, "type", typ)
 			continue
 		}
 		if err = ch.handleFrame(typ, payload); err != nil {

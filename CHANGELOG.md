@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recovering a binding after a reconnect failed when the broker's cleanup of the old connection deleted an auto-delete exchange after the client had redeclared it. The client now redeclares the exchange and queue and retries the binding.
+
 ## [1.0.0] - 2026-10-06
 
 ### Added
