@@ -25,7 +25,7 @@ const (
 )
 
 // closeTimeout is how long Close waits for the broker's close-ok.
-var closeTimeout = 10 * time.Second
+const closeTimeout = 10 * time.Second
 
 // Config holds the optional settings for a connection. Settings in the URI
 // query string are used for the fields left unset here.
@@ -106,6 +106,8 @@ type Connection struct {
 	secretCh   chan struct{} // closed when secretOk increases
 	closing    atomic.Bool
 	cause      atomic.Pointer[error] // why the connection is being closed
+
+	closeTimeout time.Duration // how long Close waits for close-ok, set in tests
 
 	done chan struct{}
 	err  error // set before done is closed
@@ -217,14 +219,15 @@ func (r *deadlineReader) Read(p []byte) (int, error) {
 func open(ctx context.Context, nc net.Conn, u URI, cfg Config) (*Connection, error) {
 	rd := &deadlineReader{conn: nc}
 	c := &Connection{
-		conn:     nc,
-		rd:       rd,
-		br:       bufio.NewReaderSize(rd, int(cfg.FrameMax)+frameOverhead),
-		uri:      u,
-		cfg:      cfg,
-		logger:   cfg.Logger,
-		secretCh: make(chan struct{}),
-		done:     make(chan struct{}),
+		conn:         nc,
+		rd:           rd,
+		br:           bufio.NewReaderSize(rd, int(cfg.FrameMax)+frameOverhead),
+		uri:          u,
+		cfg:          cfg,
+		logger:       cfg.Logger,
+		secretCh:     make(chan struct{}),
+		closeTimeout: closeTimeout,
+		done:         make(chan struct{}),
 	}
 
 	// Abort the handshake when the context is done.
@@ -701,7 +704,7 @@ func (c *Connection) CloseReason(reason string) error {
 		return nil
 	}
 	// Don't block forever on a peer that doesn't read
-	c.conn.SetWriteDeadline(time.Now().Add(closeTimeout))
+	c.conn.SetWriteDeadline(time.Now().Add(c.closeTimeout))
 	err := c.writeMethod(context.Background(), 0, connectionClose, true, func(b []byte) ([]byte, error) {
 		b = be.AppendUint16(b, ReplySuccess)
 		b = appendShortStr(b, truncate(reason, 255))
@@ -714,7 +717,7 @@ func (c *Connection) CloseReason(reason string) error {
 	}
 	select {
 	case <-c.done:
-	case <-time.After(closeTimeout):
+	case <-time.After(c.closeTimeout):
 		c.abort(ErrClosed)
 		<-c.done
 	}

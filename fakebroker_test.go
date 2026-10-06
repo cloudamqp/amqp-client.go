@@ -656,9 +656,6 @@ func TestFakeNoAckDeliveryWhileClosing(t *testing.T) {
 
 // Issue #9
 func TestFakeChannelIDReservedAfterCloseTimeout(t *testing.T) {
-	old := closeTimeout
-	closeTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { closeTimeout = old })
 	lateCloseOk := make(chan struct{})
 	conn, err := dialFake(t, nil, func(b []byte) []byte {
 		b = be.AppendUint16(b, 1) // a single channel
@@ -675,6 +672,7 @@ func TestFakeChannelIDReservedAfterCloseTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	conn.closeTimeout = 100 * time.Millisecond
 	ctx := context.Background()
 	ch, err := conn.Channel(ctx)
 	if err != nil {

@@ -283,7 +283,7 @@ func (ch *Channel) CloseReason(code uint16, reason string) error {
 	}
 	ch.closing.Store(true)
 	ch.rpcMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), closeTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), ch.conn.closeTimeout)
 	defer cancel()
 	_, err := ch.call(ctx, channelClose, channelCloseOk, callOpts{
 		onWrite: func() { ch.wclosed = true },
@@ -305,6 +305,24 @@ func (ch *Channel) CloseReason(code uint16, reason string) error {
 // It doesn't free the channel id, see removeChannel.
 func (ch *Channel) shutdown(err error) {
 	ch.once.Do(func() {
+		// Settle confirmations before done is closed, so that whoever
+		// waits for done sees the outcome
+		ch.confMu.Lock()
+		// The fate of unconfirmed messages is unknown. A broker exception
+		// may have been caused by any message on the channel, so it's not
+		// returned as is, it would look like each message's own failure.
+		unconfErr := &unconfirmedError{err}
+		if ch.uhead < len(ch.unconfirmed) {
+			ch.confErr = unconfErr
+		}
+		for _, u := range ch.unconfirmed[ch.uhead:] {
+			if u.conf != nil {
+				u.conf.resolve(false, unconfErr)
+			}
+		}
+		ch.unconfirmed, ch.uhead = nil, 0
+		ch.confMu.Unlock()
+
 		ch.rpcMu.Lock()
 		ch.err = err
 		close(ch.done)
@@ -323,6 +341,7 @@ func (ch *Channel) shutdown(err error) {
 			w.deliver(rpcReply{err: err})
 		}
 
+		// After done, so that a stopped consumer sees its channel closed
 		ch.consMu.Lock()
 		for tag, c := range ch.consumers {
 			// Deliveries to no-ack consumers are already settled, keep them
@@ -330,23 +349,6 @@ func (ch *Channel) shutdown(err error) {
 			delete(ch.consumers, tag)
 		}
 		ch.consMu.Unlock()
-
-		ch.confMu.Lock()
-		// The fate of unconfirmed messages is unknown. A broker exception
-		// may have been caused by any message on the channel, so it's not
-		// returned as is, it would look like each message's own failure.
-		unconfErr := &unconfirmedError{err}
-		if ch.uhead < len(ch.unconfirmed) {
-			ch.confErr = unconfErr
-		}
-		for _, u := range ch.unconfirmed[ch.uhead:] {
-			if u.conf != nil {
-				u.conf.resolve(false, unconfErr)
-			}
-		}
-		ch.unconfirmed, ch.uhead = nil, 0
-		ch.confMu.Unlock()
-
 	})
 }
 
